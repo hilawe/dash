@@ -8,6 +8,7 @@
 #include <bls/bls.h>
 #include <evo/dmn_types.h>
 #include <evo/netinfo.h>
+#include <evo/sharedcollateral.h>
 #include <evo/specialtx.h>
 #include <primitives/transaction.h>
 #include <util/std23.h>
@@ -124,8 +125,16 @@ public:
     uint16_t nOperatorReward{0};
     CScript scriptPayout;
     MasternodePayoutShares payouts;
+    // Shared collateral (dashpay/dips#187 prototype): a non-empty share table makes
+    // this a shared registration. Serialized after `payouts` for MultiPayout payloads.
+    CollateralShareList shares;
+    std::vector<std::vector<unsigned char>> vecJoinSigs; // 65-byte compact sigs over SharedRegConsentHash, share order
+    uint32_t nEarlyPeriodBlocks{0};
+    CAmount nEarlyPenalty{0};
     uint256 inputsHash; // replay protection
     std::vector<unsigned char> vchSig;
+
+    bool IsShared() const { return !shares.empty(); }
 
     SERIALIZE_METHODS(CProRegTx, obj)
     {
@@ -157,6 +166,21 @@ public:
             for (auto& payout : obj.payouts) {
                 READWRITE(payout);
             }
+            // dips#187: share table, appended immediately after payouts. A non-shared
+            // payload serializes sharesCount = 0, no sigs, and zeroed penalty fields.
+            uint8_t shares_count{0};
+            SER_WRITE(obj, shares_count = static_cast<uint8_t>(obj.shares.size()));
+            READWRITE(shares_count);
+            SER_READ(obj, obj.shares.resize(shares_count));
+            for (auto& share : obj.shares) {
+                READWRITE(share);
+            }
+            SER_READ(obj, obj.vecJoinSigs.assign(shares_count, std::vector<unsigned char>(SharedCollateral::COMPACT_SIG_SIZE)));
+            for (auto& sig : obj.vecJoinSigs) {
+                SER_WRITE(obj, if (sig.size() != SharedCollateral::COMPACT_SIG_SIZE) throw std::ios_base::failure("joinSig must be 65 bytes"));
+                READWRITE(Span{sig});
+            }
+            READWRITE(obj.nEarlyPeriodBlocks, obj.nEarlyPenalty);
         } else {
             READWRITE(obj.scriptPayout);
         }

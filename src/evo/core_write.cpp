@@ -342,6 +342,23 @@ UniValue CProRegTx::ToJson() const
     }
     ret.pushKV("pubKeyOperator", pubKeyOperator.ToString());
     ret.pushKV("operatorReward", (double)nOperatorReward / 100);
+    if (IsShared()) {
+        // dips#187 shared registration: expose the share table for diagnostics
+        UniValue sharesArr(UniValue::VARR);
+        for (const auto& share : shares) {
+            UniValue s(UniValue::VOBJ);
+            s.pushKV("amount", share.amount);
+            if (CTxDestination d; ExtractDestination(share.refundScript, d)) s.pushKV("refundAddress", EncodeDestination(d));
+            if (!share.rewardScript.empty()) {
+                if (CTxDestination d; ExtractDestination(share.rewardScript, d)) s.pushKV("rewardAddress", EncodeDestination(d));
+            }
+            s.pushKV("ownerKeyID", share.ownerKeyID.ToString());
+            sharesArr.push_back(s);
+        }
+        ret.pushKV("shares", sharesArr);
+        ret.pushKV("earlyPeriodBlocks", (uint64_t)nEarlyPeriodBlocks);
+        ret.pushKV("earlyPenalty", nEarlyPenalty);
+    }
     if (nType == MnType::Evo) {
         ret.pushKV("platformNodeID", platformNodeID.ToString());
         if (IsServiceDeprecatedRPCEnabled()) {

@@ -224,6 +224,7 @@ BITCOIN_CORE_H = \
   evo/mnhftx.h \
   evo/netinfo.h \
   evo/providertx.h \
+  evo/sharedcollateral.h \
   evo/simplifiedmns.h \
   evo/smldiff.h \
   evo/specialtx.h \
@@ -520,6 +521,7 @@ libbitcoin_node_a_SOURCES = \
   evo/mnauth.cpp \
   evo/mnhftx.cpp \
   evo/providertx.cpp \
+  evo/sharedcollateral.cpp \
   evo/simplifiedmns.cpp \
   evo/smldiff.cpp \
   evo/specialtx.cpp \
@@ -1204,6 +1206,7 @@ dash_chainstate_SOURCES = \
   evo/mnhftx.cpp \
   evo/providertx.cpp \
   evo/providertx_util.cpp \
+  evo/sharedcollateral.cpp \
   evo/simplifiedmns.cpp \
   evo/smldiff.cpp \
   evo/specialtx.cpp \

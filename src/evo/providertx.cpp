@@ -148,14 +148,49 @@ bool CProRegTx::IsTriviallyValid(gsl::not_null<const CBlockIndex*> pindexPrev, c
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-protx-mode");
     }
 
-    if (keyIDOwner.IsNull() || !pubKeyOperator.Get().IsValid() || keyIDVoting.IsNull()) {
+    if (!pubKeyOperator.Get().IsValid() || keyIDVoting.IsNull()) {
         return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-key-null");
     }
     if (pubKeyOperator.IsLegacy() != (nVersion == ProTxVersion::LegacyBLS)) {
         return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-operator-pubkey");
     }
-    const auto owner_payouts = GetOwnerPayouts(nVersion, scriptPayout, payouts);
-    if (!IsPayoutListTriviallyValid(owner_payouts, keyIDOwner, keyIDVoting, state)) return false;
+    if (IsShared()) {
+        // dips#187 shared registration: the share owner keys replace keyIDOwner, owner
+        // rewards derive from the share table, and every participant consents via joinSigs
+        // (verified contextually in CheckProRegTx against SharedRegConsentHash).
+        if (nVersion < ProTxVersion::MultiPayout) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-protx-shared-version");
+        }
+        if (nType != MnType::Regular) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-type");
+        }
+        if (!keyIDOwner.IsNull()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-owner-key");
+        }
+        if (!payouts.empty() || !scriptPayout.empty()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-payouts");
+        }
+        if (vecJoinSigs.size() != shares.size()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-joinsigs");
+        }
+        for (const auto& sig : vecJoinSigs) {
+            if (sig.size() != SharedCollateral::COMPACT_SIG_SIZE) {
+                return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-joinsigs");
+            }
+        }
+        if (!IsShareTableTriviallyValid(shares, keyIDVoting, nEarlyPeriodBlocks, nEarlyPenalty, state)) {
+            return false;
+        }
+    } else {
+        if (nEarlyPeriodBlocks != 0 || nEarlyPenalty != 0 || !vecJoinSigs.empty()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-fields");
+        }
+        if (keyIDOwner.IsNull()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-key-null");
+        }
+        const auto owner_payouts = GetOwnerPayouts(nVersion, scriptPayout, payouts);
+        if (!IsPayoutListTriviallyValid(owner_payouts, keyIDOwner, keyIDVoting, state)) return false;
+    }
     if (netInfo->CanStorePlatform() != (nVersion >= ProTxVersion::ExtAddr)) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-protx-netinfo-version");
     }

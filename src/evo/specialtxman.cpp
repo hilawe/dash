@@ -13,6 +13,7 @@
 #include <evo/deterministicmns.h>
 #include <evo/mnhftx.h>
 #include <evo/netinfo.h>
+#include <evo/sharedcollateral.h>
 #include <evo/simplifiedmns.h>
 #include <llmq/blockprocessor.h>
 #include <llmq/commitment.h>
@@ -1048,7 +1049,31 @@ bool CheckProRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
 
     CAmount expectedCollateral = GetMnType(opt_ptx->nType).collat_amount;
 
-    if (!opt_ptx->collateralOutpoint.hash.IsNull()) {
+    if (opt_ptx->IsShared()) {
+        // dips#187 shared registration: the collateral is internal, is exactly the
+        // template script, and the share amounts sum to the required collateral.
+        // Ownership is proved by the joinSigs over SharedRegConsentHash, not by a
+        // collateral key, so there is no keyForPayloadSig and no payout-key-safety check.
+        if (!opt_ptx->collateralOutpoint.hash.IsNull()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-collateral-external");
+        }
+        if (opt_ptx->collateralOutpoint.n >= tx.vout.size()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-collateral-index");
+        }
+        const CTxOut& collOut = tx.vout[opt_ptx->collateralOutpoint.n];
+        if (collOut.nValue != expectedCollateral) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-collateral");
+        }
+        if (!SharedCollateral::IsTemplateScript(collOut.scriptPubKey)) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-collateral-script");
+        }
+        CAmount shareSum{0};
+        for (const auto& share : opt_ptx->shares) shareSum += share.amount;
+        if (shareSum != expectedCollateral) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-collateral-sum");
+        }
+        collateralOutpoint = COutPoint(tx.GetHash(), opt_ptx->collateralOutpoint.n);
+    } else if (!opt_ptx->collateralOutpoint.hash.IsNull()) {
         Coin coin;
         if (!view.GetCoin(opt_ptx->collateralOutpoint, coin) || coin.IsSpent() || coin.out.nValue != expectedCollateral) {
             return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-collateral");
@@ -1083,7 +1108,9 @@ bool CheckProRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
 
     // don't allow reuse of collateral key for other keys (don't allow people to put the collateral key onto an online server)
     // this check applies to internal and external collateral, but internal collaterals are not necessarily a P2PKH
-    if (!IsPayoutListKeySafe(GetOwnerPayouts(opt_ptx->nVersion, opt_ptx->scriptPayout, opt_ptx->payouts),
+    // (shared registrations have no collateral key and derive owner payouts from the share table, so this is skipped)
+    if (!opt_ptx->IsShared() &&
+        !IsPayoutListKeySafe(GetOwnerPayouts(opt_ptx->nVersion, opt_ptx->scriptPayout, opt_ptx->payouts),
                              collateralTxDest, opt_ptx->keyIDOwner, opt_ptx->keyIDVoting,
                              opt_ptx->nVersion >= ProTxVersion::MultiPayout, state)) return false;
 
@@ -1107,8 +1134,19 @@ bool CheckProRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
             }
         }
 
-        // never allow duplicate keys, even if this ProTx would replace an existing MN
-        if (mnList.HasUniqueProperty(opt_ptx->keyIDOwner) || mnList.HasUniqueProperty(opt_ptx->pubKeyOperator)) {
+        // never allow duplicate keys, even if this ProTx would replace an existing MN.
+        // For a shared registration the owner keys are the share owner keys; each must
+        // be unique across the whole masternode list (dips#187 spec 4.9).
+        if (mnList.HasUniqueProperty(opt_ptx->pubKeyOperator)) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-dup-key");
+        }
+        if (opt_ptx->IsShared()) {
+            for (const auto& share : opt_ptx->shares) {
+                if (mnList.HasUniqueProperty(share.ownerKeyID)) {
+                    return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-dup-key");
+                }
+            }
+        } else if (mnList.HasUniqueProperty(opt_ptx->keyIDOwner)) {
             return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-dup-key");
         }
 
@@ -1131,7 +1169,25 @@ bool CheckProRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
         return false;
     }
 
-    if (keyForPayloadSig) {
+    if (opt_ptx->IsShared()) {
+        // dips#187: every participant consents to the exact registration by signing
+        // SharedRegConsentHash with their share owner key. The digest binds the funding
+        // prevouts and all outputs, so co-signer txid malleability cannot invalidate it
+        // (this is the property that closes co-signer malleability). The collateral payload sig must be empty.
+        if (!opt_ptx->vchSig.empty()) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-protx-sig");
+        }
+        if (check_sigs) {
+            const uint256 consentHash = ComputeSharedRegConsentHash(*opt_ptx, tx);
+            for (size_t i = 0; i < opt_ptx->shares.size(); ++i) {
+                std::string strError;
+                if (!CHashSigner::VerifyHash(consentHash, opt_ptx->shares[i].ownerKeyID,
+                                             opt_ptx->vecJoinSigs[i], strError)) {
+                    return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-protx-joinsig");
+                }
+            }
+        }
+    } else if (keyForPayloadSig) {
         // collateral is not part of this ProRegTx, so we must verify ownership of the collateral
         if (check_sigs && !CheckStringSig(*opt_ptx, *keyForPayloadSig, state)) {
             // pass the state returned by the function above
