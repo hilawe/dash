@@ -2331,7 +2331,8 @@ static RPCHelpMan protx_shared_dissolve()
     for (size_t k = 0; k < nonActor.size(); ++k) {
         const uint16_t i = nonActor[k];
         const bool lastNonActor = (k + 1 == nonActor.size());
-        const CAmount bonus = lastNonActor ? (P - bonusAssigned) : (W > 0 ? (P * shares[i].amount) / W : 0);
+        const CAmount bonus = lastNonActor ? (P - bonusAssigned)
+                                           : (W > 0 ? SharedCollateral::MulDiv(P, shares[i].amount, W) : 0);
         bonusAssigned += bonus;
         tx.vout.emplace_back(shares[i].amount + bonus, shares[i].refundScript);
     }

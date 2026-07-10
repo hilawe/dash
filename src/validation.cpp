@@ -54,6 +54,7 @@
 #include <evo/deterministicmns.h>
 #include <evo/evodb.h>
 #include <evo/specialtx.h>
+#include <evo/sharedcollateral.h>
 #include <evo/specialtxman.h>
 #include <masternode/payments.h>
 #include <stats/client.h>
@@ -959,6 +960,15 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // NOTE: we use UTXO here and do NOT allow mempool txes as masternode collaterals
     if (!m_chain_helper.special_tx->CheckSpecialTx(tx, m_active_chainstate.m_chain.Tip(), m_active_chainstate.CoinsTip(), true, state))
         return false;
+
+    // dips#187 template spend/creation enforcement for mempool acceptance, gated on
+    // v24. CheckSpecialTx above returns early for a normal transaction, so a normal transaction
+    // spending a template output is caught here rather than there.
+    if (DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_V24)) {
+        if (!CheckTemplateSpendCreation(tx, m_view, state)) {
+            return false;
+        }
+    }
 
     if (m_pool.existsProviderTxConflict(tx)) {
         return state.Invalid(TxValidationResult::TX_CONFLICT, "protx-dup");

@@ -168,6 +168,11 @@ public:
             }
             // dips#187: share table, appended immediately after payouts. A non-shared
             // payload serializes sharesCount = 0, no sigs, and zeroed penalty fields.
+            // INTENTIONAL wire-format change to the version-4 payload: the spec
+            // requires it and is sound because DIP-0026 version 4 is UNRELEASED and this DIP
+            // deploys in the SAME v24 upgrade, so no pre-existing version-4 transaction can
+            // exist to be misparsed. It would be a consensus break only if applied to an
+            // already-activated version 4, which is not the case here.
             uint8_t shares_count{0};
             SER_WRITE(obj, shares_count = static_cast<uint8_t>(obj.shares.size()));
             READWRITE(shares_count);

@@ -19,7 +19,12 @@ spend the template collateral, dissolves it unilaterally during the early period
 confirms every participant's principal landed at its immutable refund address.
 """
 from test_framework.test_framework import DashTestFramework
-from test_framework.util import assert_equal, assert_greater_than, assert_raises_rpc_error, softfork_active
+from test_framework.util import (
+    assert_equal,
+    assert_greater_than,
+    assert_raises_rpc_error,
+    softfork_active,
+)
 
 V24_ACTIVATION_THRESHOLD = 100
 COIN = 100000000
@@ -63,6 +68,26 @@ class TegaraSharedCollateralTest(DashTestFramework):
         ]
         early_penalty = 5  # DASH, < min share (100)
         early_period = 100
+
+        self.log.info("share-table validation rejects malformed registrations")
+        # shares must sum to the collateral (1000 DASH)
+        bad_sum = [{"amount": 400, "refund": refund0, "owner": owner0},
+                   {"amount": 500, "refund": refund1, "owner": owner1}]
+        assert_raises_rpc_error(None, "bad-protx-shared-collateral-sum", node.protxsharedregister,
+                                bad_sum, operator, voting, 0, early_period, early_penalty, fund_addr)
+        # each share must be at least 100 DASH
+        bad_small = [{"amount": 950, "refund": refund0, "owner": owner0},
+                     {"amount": 50, "refund": refund1, "owner": owner1}]
+        assert_raises_rpc_error(None, "bad-protx-share-amount", node.protxsharedregister,
+                                bad_small, operator, voting, 0, early_period, early_penalty, fund_addr)
+        # owner keys must be distinct
+        dup_owner = [{"amount": 500, "refund": refund0, "owner": owner0},
+                     {"amount": 500, "refund": refund1, "owner": owner0}]
+        assert_raises_rpc_error(None, "bad-protx-share-owner-key", node.protxsharedregister,
+                                dup_owner, operator, voting, 0, early_period, early_penalty, fund_addr)
+        # the penalty must be below the minimum share
+        assert_raises_rpc_error(None, "bad-protx-share-penalty", node.protxsharedregister,
+                                shares, operator, voting, 0, early_period, 600, fund_addr)
 
         self.log.info("register a shared masternode")
         txid = node.protxsharedregister(shares, operator, voting, 0, early_period, early_penalty, fund_addr)

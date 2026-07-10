@@ -48,6 +48,24 @@ static constexpr CAmount MIN_SHARE_AMOUNT{100 * COIN};
 static constexpr uint32_t MAX_EARLY_PERIOD_BLOCKS{420480}; // ~2 years at 2.5-minute blocks
 static constexpr size_t COMPACT_SIG_SIZE{65};
 
+// Compute a*b/c with a wide intermediate. The reward and penalty splits multiply two
+// duff-scale values (a share amount is ~9e10 duffs for a 900 DASH share), whose product
+// exceeds int64 (~9.2e18) and would overflow a plain CAmount multiply. The true quotient
+// fits in CAmount (it is bounded by b). Callers must ensure c > 0. The overflow was caught
+// in review; this is the fix.
+inline CAmount MulDiv(CAmount a, CAmount b, CAmount c)
+{
+    return static_cast<CAmount>((static_cast<__int128>(a) * static_cast<__int128>(b)) / c);
+}
+
+// A 65-byte compact recoverable ECDSA signature is [header][r(32)][s(32)]. RecoverCompact
+// normalizes S internally, so it accepts a high-S variant of a valid signature, which shares
+// the same recovered key and digest but different bytes and thus a different transaction id.
+// The spec requires enforced low-S on joinSigs and dissolution sigs so these transaction ids
+// are non-malleable (non-malleability is the whole point here). This checks the header range
+// and rejects a high-S encoding by comparing S against half the curve order.
+bool IsCanonicalCompactSig(const std::vector<unsigned char>& sig);
+
 } // namespace SharedCollateral
 
 class CCollateralShare
@@ -147,5 +165,14 @@ public:
 // plus proTxHash, actorIndex, and sigCount (which selects the mode). The empty-scriptSig
 // rule plus low-S signatures pin every free byte, making the ProDisTx txid non-malleable.
 uint256 ComputeSharedDisHash(const CProDisTx& disTx, const CTransaction& tx, uint8_t sigCount);
+
+// Template collateral spend/creation enforcement (spec 4.11). Callers MUST gate this on v24
+// activation (before activation the template is a nonstandard-but-valid script). Spend rule:
+// a transaction spending a template output is valid only if it is a ProDisTx. Creation rule:
+// a template output is valid only in a shared registration (CheckProRegTx enforces the exact
+// collateral slot and uniqueness; a non-shared registration is rejected there too). Applies to
+// every transaction including the coinbase, so the caller passes each block transaction here.
+class CCoinsViewCache;
+bool CheckTemplateSpendCreation(const CTransaction& tx, const CCoinsViewCache& view, TxValidationState& state);
 
 #endif // BITCOIN_EVO_SHAREDCOLLATERAL_H

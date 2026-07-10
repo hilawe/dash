@@ -75,19 +75,27 @@ CAmount PlatformShare(const CAmount reward)
         // dips#187: a shared masternode derives its owner payouts from the share table,
         // amount-weighted, using DIP-0026's single rounding convention (sequential floor,
         // remainder to the last entry). Destination is the reward script if set, else refund.
+        // Shares may legitimately share a reward script, so outputs paying the same script are
+        // merged into one summed output; otherwise two identical expected outputs could both be
+        // satisfied by a single coinbase output and underpay the reward.
         const auto& shares = dmnPayee->pdmnState->shares;
         CAmount collateral{0};
         for (const auto& s : shares) collateral += s.amount;
         CAmount paid_owner_reward{0};
+        std::vector<std::pair<CScript, CAmount>> merged; // preserves share order for the first use of a script
         for (size_t i = 0; i < shares.size(); ++i) {
             const bool last = i + 1 == shares.size();
             const CAmount payout_amount = last ? masternodeReward - paid_owner_reward
-                                               : (masternodeReward * shares[i].amount) / collateral;
+                                               : SharedCollateral::MulDiv(masternodeReward, shares[i].amount, collateral);
             paid_owner_reward += payout_amount;
-            if (payout_amount > 0) {
-                const CScript& dest = shares[i].rewardScript.empty() ? shares[i].refundScript : shares[i].rewardScript;
-                voutMasternodePaymentsRet.emplace_back(payout_amount, dest);
-            }
+            if (payout_amount <= 0) continue;
+            const CScript& dest = shares[i].rewardScript.empty() ? shares[i].refundScript : shares[i].rewardScript;
+            auto it = std::find_if(merged.begin(), merged.end(), [&dest](const auto& p) { return p.first == dest; });
+            if (it != merged.end()) it->second += payout_amount;
+            else merged.emplace_back(dest, payout_amount);
+        }
+        for (const auto& [script, amount] : merged) {
+            voutMasternodePaymentsRet.emplace_back(amount, script);
         }
     } else {
         const auto owner_payouts = GetOwnerPayouts(dmnPayee->pdmnState->nVersion, dmnPayee->pdmnState->scriptPayout,
