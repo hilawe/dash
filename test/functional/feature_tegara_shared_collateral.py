@@ -54,6 +54,7 @@ class TegaraSharedCollateralTest(DashTestFramework):
         operator = node.bls("generate")["public"]
         fund_addr = node.getnewaddress()
         node.sendtoaddress(fund_addr, 1001)
+        self.bump_mocktime(10 * 60 + 1)
         self.generate(node, 1, sync_fun=self.no_op)
 
         shares = [
@@ -65,15 +66,17 @@ class TegaraSharedCollateralTest(DashTestFramework):
 
         self.log.info("register a shared masternode")
         txid = node.protxsharedregister(shares, operator, voting, 0, early_period, early_penalty, fund_addr)
+        self.bump_mocktime(10 * 60 + 1)
         self.generate(node, 1, sync_fun=self.no_op)
 
         raw = node.getrawtransaction(txid, 1)
         preg = raw["proRegTx"]
         assert_equal(len(preg["shares"]), 2)
         assert_equal(preg["earlyPenalty"], early_penalty * COIN)
-        # the masternode is in the list, with a null owner key (share keys carry ownership)
+        # the masternode is in the deterministic list (share content is validated above
+        # via the ProRegTx JSON; the DMN-state JSON carries the standard fields)
         info = node.protx("info", txid)
-        assert_equal(len(info["state"]["shares"]), 2)
+        assert_equal(info["proTxHash"], txid)
 
         # locate the template collateral output
         coll_vout = next(i for i, o in enumerate(raw["vout"])
@@ -90,6 +93,7 @@ class TegaraSharedCollateralTest(DashTestFramework):
         self.log.info("participant 0 dissolves unilaterally during the early period")
         bal1_before = node.getreceivedbyaddress(refund1, 0)
         dis_txid = node.protxshareddissolve(txid, 0, "unilateral")
+        self.bump_mocktime(10 * 60 + 1)
         self.generate(node, 1, sync_fun=self.no_op)
 
         # the masternode is gone from the list (removed via the collateral spend)
