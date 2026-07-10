@@ -11,6 +11,7 @@
 #include <evo/deterministicmns.h>
 #include <evo/dmn_types.h>
 #include <evo/providertx.h>
+#include <evo/sharedcollateral.h>
 #include <evo/smldiff.h>
 #include <evo/specialtx.h>
 #include <evo/specialtxman.h>
@@ -2144,6 +2145,244 @@ static RPCHelpMan bls_help()
 }
 
 #ifdef ENABLE_WALLET
+
+//
+// dips#187 shared-collateral covenant RPCs (Tegara prototype).
+//
+// These construct shared registrations and dissolutions on regtest. On a single-wallet
+// regtest node the wallet holds every share owner key, so one call can self-sign all the
+// consent and dissolution signatures. The trustlessness is a property of the CONSENSUS
+// rules, not of these constructors.
+//
+
+static RPCHelpMan protx_shared_register()
+{
+    return RPCHelpMan{"protxsharedregister",
+        "\nBuild, fund, sign, and submit a shared-collateral masternode registration (dips#187).\n"
+        "The wallet must hold every share owner key. Regtest/devnet prototype.\n",
+        {
+            {"shares", RPCArg::Type::ARR, RPCArg::Optional::NO, "The share table (2 to 8 entries)",
+                {
+                    {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                        {
+                            {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Collateral contribution (>= 100 DASH)"},
+                            {"refund", RPCArg::Type::STR, RPCArg::Optional::NO, "Immutable refund address"},
+                            {"owner", RPCArg::Type::STR, RPCArg::Optional::NO, "Share owner address (key must be in the wallet)"},
+                            {"reward", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Reward address (defaults to refund)"},
+                        }},
+                }},
+            {"operatorPubKey", RPCArg::Type::STR, RPCArg::Optional::NO, "The operator BLS public key"},
+            {"votingAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "The voting address"},
+            {"operatorReward", RPCArg::Type::NUM, RPCArg::Optional::NO, "Operator reward in percent (0-100)"},
+            {"earlyPeriodBlocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "Length of the early period in blocks"},
+            {"earlyPenalty", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Unilateral early-exit penalty (< min share)"},
+            {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund collateral and fee from"},
+        },
+        RPCResult{RPCResult::Type::STR_HEX, "txid", "The transaction id"},
+        RPCExamples{""},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const NodeContext& node = EnsureAnyNodeContext(request.context);
+    const ChainstateManager& chainman = EnsureChainman(node);
+    CChainstateHelper& chain_helper = *CHECK_NONFATAL(node.chain_helper);
+
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    EnsureWalletIsUnlocked(*pwallet);
+
+    CProRegTx ptx;
+    ptx.nType = MnType::Regular;
+    ptx.nVersion = ProTxVersion::GetMaxFromDeployment<CProRegTx>(
+        WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip()), chainman, /*is_basic_override=*/true);
+    ptx.netInfo = NetInfoInterface::MakeNetInfo(ptx.nVersion); // empty: registers PoSe-banned
+    ptx.keyIDOwner = CKeyID(); // null: the share owner keys replace it
+
+    const UniValue& sharesArr = request.params[0].get_array();
+    if (sharesArr.size() < SharedCollateral::MIN_SHARES || sharesArr.size() > SharedCollateral::MAX_SHARES) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "shares must have 2 to 8 entries");
+    }
+    for (size_t i = 0; i < sharesArr.size(); ++i) {
+        const UniValue& s = sharesArr[i].get_obj();
+        CCollateralShare share;
+        share.amount = AmountFromValue(s["amount"]);
+        CTxDestination refundDest = DecodeDestination(s["refund"].get_str());
+        if (!IsValidDestination(refundDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid refund address");
+        share.refundScript = GetScriptForDestination(refundDest);
+        if (!s["reward"].isNull() && !s["reward"].get_str().empty()) {
+            CTxDestination rewardDest = DecodeDestination(s["reward"].get_str());
+            if (!IsValidDestination(rewardDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid reward address");
+            share.rewardScript = GetScriptForDestination(rewardDest);
+        }
+        share.ownerKeyID = ParsePubKeyIDFromAddress(s["owner"].get_str(), "owner address");
+        ptx.shares.push_back(share);
+    }
+
+    ptx.pubKeyOperator.Set(ParseBLSPubKey(request.params[1].get_str(), "operator BLS key", /*legacy=*/false), false);
+    ptx.keyIDVoting = ParsePubKeyIDFromAddress(request.params[2].get_str(), "voting address");
+    int64_t operatorReward;
+    if (!ParseFixedPoint(request.params[3].getValStr(), 2, &operatorReward) || operatorReward < 0 || operatorReward > 10000) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "operatorReward must be between 0 and 100");
+    }
+    ptx.nOperatorReward = operatorReward;
+    ptx.nEarlyPeriodBlocks = request.params[4].getInt<int64_t>();
+    ptx.nEarlyPenalty = AmountFromValue(request.params[5]);
+
+    CTxDestination fundDest = DecodeDestination(request.params[6].get_str());
+    if (!IsValidDestination(fundDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid fund address");
+
+    // the template collateral output
+    CAmount collateral = GetMnType(MnType::Regular).collat_amount;
+    CMutableTransaction tx;
+    tx.nVersion = 3;
+    tx.nType = TRANSACTION_PROVIDER_REGISTER;
+    tx.vout.emplace_back(collateral, SharedCollateral::TemplateScript());
+
+    // pre-size the joinSigs so the funding fee accounts for them, then fund
+    ptx.vecJoinSigs.assign(ptx.shares.size(), std::vector<unsigned char>(SharedCollateral::COMPACT_SIG_SIZE));
+    FundSpecialTx(*pwallet, tx, ptx, fundDest);
+
+    // locate the template collateral output and set the internal collateral outpoint
+    uint32_t collateralIndex = (uint32_t)-1;
+    for (uint32_t i = 0; i < tx.vout.size(); ++i) {
+        if (SharedCollateral::IsTemplateScript(tx.vout[i].scriptPubKey)) { collateralIndex = i; break; }
+    }
+    CHECK_NONFATAL(collateralIndex != (uint32_t)-1);
+    ptx.collateralOutpoint = COutPoint(uint256(), collateralIndex);
+    UpdateSpecialTxInputsHash(tx, ptx);
+
+    // each participant signs the consent digest with their share owner key
+    const uint256 consentHash = ComputeSharedRegConsentHash(ptx, CTransaction(tx));
+    {
+        LOCK(pwallet->cs_wallet);
+        for (size_t i = 0; i < ptx.shares.size(); ++i) {
+            ptx.vecJoinSigs[i].clear();
+            if (!pwallet->SignSpecialTxPayload(consentHash, ptx.shares[i].ownerKeyID, ptx.vecJoinSigs[i])) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("failed to sign joinSig for share %d (owner key not in wallet?)", i));
+            }
+        }
+    }
+
+    SetTxPayload(tx, ptx);
+    return SignAndSendSpecialTx(request, chain_helper, chainman, tx, /*fSubmit=*/true);
+},
+    };
+}
+
+static RPCHelpMan protx_shared_dissolve()
+{
+    return RPCHelpMan{"protxshareddissolve",
+        "\nBuild, sign, and submit a ProDisTx dissolving a shared masternode (dips#187).\n"
+        "Refunds every participant to their immutable refund script; the actor pays the\n"
+        "early-period penalty (if any) and the fee. Regtest/devnet prototype.\n",
+        {
+            {"proTxHash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The shared masternode's ProRegTx hash"},
+            {"actorIndex", RPCArg::Type::NUM, RPCArg::Optional::NO, "Index into the share table of the actor"},
+            {"mode", RPCArg::Type::STR, RPCArg::Default{"unilateral"}, "\"unilateral\" or \"unanimous\""},
+            {"feeDuffs", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Flat fee in duffs (default 100000), paid from the actor's share"},
+        },
+        RPCResult{RPCResult::Type::STR_HEX, "txid", "The transaction id"},
+        RPCExamples{""},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const NodeContext& node = EnsureAnyNodeContext(request.context);
+    const ChainstateManager& chainman = EnsureChainman(node);
+    CDeterministicMNManager& dmnman = *CHECK_NONFATAL(node.dmnman);
+
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    EnsureWalletIsUnlocked(*pwallet);
+
+    CProDisTx disTx;
+    disTx.proTxHash = ParseHashV(request.params[0], "proTxHash");
+    disTx.actorIndex = request.params[1].getInt<int>();
+    const std::string mode = request.params[2].isNull() ? "unilateral" : request.params[2].get_str();
+    const CAmount fee = request.params[3].isNull() ? 100000 : request.params[3].getInt<int64_t>();
+
+    auto dmn = dmnman.GetListAtChainTip().GetMN(disTx.proTxHash);
+    if (!dmn || dmn->pdmnState->shares.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "not a shared masternode");
+    }
+    const auto& shares = dmn->pdmnState->shares;
+    const uint16_t sharesCount = static_cast<uint16_t>(shares.size());
+    const uint16_t a = disTx.actorIndex;
+    if (a >= sharesCount) throw JSONRPCError(RPC_INVALID_PARAMETER, "actorIndex out of range");
+
+    const bool unanimous = (mode == "unanimous");
+    if (!unanimous && mode != "unilateral") throw JSONRPCError(RPC_INVALID_PARAMETER, "mode must be unilateral or unanimous");
+    const uint8_t sigCount = unanimous ? static_cast<uint8_t>(sharesCount) : 1;
+
+    const int spendHeight = WITH_LOCK(::cs_main, return chainman.ActiveChain().Height()) + 1;
+    const bool early = (spendHeight - dmn->pdmnState->nRegisteredHeight) < (int)dmn->pdmnState->nEarlyPeriodBlocks;
+    const CAmount P = (unanimous || !early) ? 0 : dmn->pdmnState->nEarlyPenalty;
+
+    CAmount W{0};
+    for (uint16_t i = 0; i < sharesCount; ++i) if (i != a) W += shares[i].amount;
+
+    CMutableTransaction tx;
+    tx.nVersion = 3;
+    tx.nType = TRANSACTION_PROVIDER_DISSOLVE;
+    tx.vin.emplace_back(dmn->collateralOutpoint); // empty scriptSig by default
+
+    // non-actor outputs, in share order, with the penalty distributed by sequential floor
+    // (remainder to the last non-actor) so the bonus sum equals P exactly
+    CAmount bonusAssigned{0};
+    std::vector<uint16_t> nonActor;
+    for (uint16_t i = 0; i < sharesCount; ++i) if (i != a) nonActor.push_back(i);
+    for (size_t k = 0; k < nonActor.size(); ++k) {
+        const uint16_t i = nonActor[k];
+        const bool lastNonActor = (k + 1 == nonActor.size());
+        const CAmount bonus = lastNonActor ? (P - bonusAssigned) : (W > 0 ? (P * shares[i].amount) / W : 0);
+        bonusAssigned += bonus;
+        tx.vout.emplace_back(shares[i].amount + bonus, shares[i].refundScript);
+    }
+    // actor output (omit if zero-value)
+    const CAmount actorValue = shares[a].amount - P - fee;
+    if (actorValue < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "fee plus penalty exceeds the actor's share");
+    if (actorValue > 0) tx.vout.emplace_back(actorValue, shares[a].refundScript);
+
+    // sign the dissolution digest (which commits sigCount, pinning the mode)
+    const uint256 disHash = ComputeSharedDisHash(disTx, CTransaction(tx), sigCount);
+    {
+        LOCK(pwallet->cs_wallet);
+        if (unanimous) {
+            for (uint16_t i = 0; i < sharesCount; ++i) {
+                std::vector<unsigned char> sig;
+                if (!pwallet->SignSpecialTxPayload(disHash, shares[i].ownerKeyID, sig)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("failed to sign for share %d", i));
+                }
+                disTx.vecSigs.push_back(sig);
+            }
+        } else {
+            std::vector<unsigned char> sig;
+            if (!pwallet->SignSpecialTxPayload(disHash, shares[a].ownerKeyID, sig)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "failed to sign as the actor");
+            }
+            disTx.vecSigs.push_back(sig);
+        }
+    }
+
+    SetTxPayload(tx, disTx);
+
+    // pre-check, then submit directly: the collateral input carries an empty scriptSig by
+    // covenant rule, so this path does not run the wallet input signer.
+    {
+        LOCK(::cs_main);
+        TxValidationState state;
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        if (!node.chain_helper->special_tx->CheckSpecialTx(CTransaction(tx), tip, chainman.ActiveChainstate().CoinsTip(), true, state)) {
+            throw JSONRPCError(RPC_VERIFY_ERROR, state.ToString());
+        }
+    }
+    CDataStream ds(SER_NETWORK, PROTOCOL_VERSION);
+    ds << tx;
+    JSONRPCRequest sendRequest(request);
+    sendRequest.params.setArray();
+    sendRequest.params.push_back(HexStr(ds));
+    return ::sendrawtransaction().HandleRequest(sendRequest).get_str();
+},
+    };
+}
+
 Span<const CRPCCommand> GetWalletEvoRPCCommands()
 {
     static const CRPCCommand commands[]{
@@ -2160,6 +2399,8 @@ Span<const CRPCCommand> GetWalletEvoRPCCommands()
         {"evo", &protx_register_submit},
         {"evo", &protx_update_registrar},
         {"evo", &protx_revoke},
+        {"evo", &protx_shared_register},
+        {"evo", &protx_shared_dissolve},
         {"hidden", &protx_register_legacy},
         {"hidden", &protx_register_fund_legacy},
         {"hidden", &protx_register_prepare_legacy},
