@@ -98,10 +98,17 @@ class TegaraSharedCollateralTest(DashTestFramework):
         preg = raw["proRegTx"]
         assert_equal(len(preg["shares"]), 2)
         assert_equal(preg["earlyPenalty"], early_penalty * COIN)
-        # the masternode is in the deterministic list (share content is validated above
-        # via the ProRegTx JSON; the DMN-state JSON carries the standard fields)
+        # the deterministic-list state (protx info) now carries the share table too, so a
+        # shared masternode is fully inspectable without fetching its registration tx
         info = node.protx("info", txid)
         assert_equal(info["proTxHash"], txid)
+        state = info["state"]
+        assert_equal(len(state["shares"]), 2)
+        assert_equal(state["earlyPenalty"], early_penalty * COIN)
+        assert_equal(state["earlyPeriodBlocks"], early_period)
+        assert_equal([s["amount"] for s in state["shares"]], [500 * COIN, 500 * COIN])
+        # the recorded refund addresses match what was registered, in share order
+        assert_equal([s["refundAddress"] for s in state["shares"]], [refund0, refund1])
 
         # locate the template collateral output
         coll_vout = next(i for i, o in enumerate(raw["vout"])

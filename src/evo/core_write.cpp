@@ -270,6 +270,24 @@ UniValue CDeterministicMNState::ToJson(MnType nType) const
     if (ExtractDestination(scriptOperatorPayout, dest)) {
         obj.pushKV("operatorPayoutAddress", EncodeDestination(dest));
     }
+    if (!shares.empty()) {
+        // dips#187 shared masternode: expose the deterministic share table, matching the
+        // shape CProRegTx::ToJson uses, so `protx info` and the registration JSON agree
+        UniValue sharesArr(UniValue::VARR);
+        for (const auto& share : shares) {
+            UniValue s(UniValue::VOBJ);
+            s.pushKV("amount", share.amount);
+            if (CTxDestination d; ExtractDestination(share.refundScript, d)) s.pushKV("refundAddress", EncodeDestination(d));
+            if (!share.rewardScript.empty()) {
+                if (CTxDestination d; ExtractDestination(share.rewardScript, d)) s.pushKV("rewardAddress", EncodeDestination(d));
+            }
+            s.pushKV("ownerKeyID", share.ownerKeyID.ToString());
+            sharesArr.push_back(s);
+        }
+        obj.pushKV("shares", sharesArr);
+        obj.pushKV("earlyPeriodBlocks", (uint64_t)nEarlyPeriodBlocks);
+        obj.pushKV("earlyPenalty", nEarlyPenalty);
+    }
     return obj;
 }
 
