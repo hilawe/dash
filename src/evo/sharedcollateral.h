@@ -6,6 +6,7 @@
 #define BITCOIN_EVO_SHAREDCOLLATERAL_H
 
 #include <consensus/amount.h>
+#include <primitives/transaction.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <serialize.h>
@@ -16,6 +17,7 @@
 class CProRegTx;
 class CTransaction;
 class TxValidationState;
+class UniValue;
 class uint256;
 
 // Prototype implementation of the shared masternode collateral covenant
@@ -83,5 +85,67 @@ bool IsShareTableTriviallyValid(const CollateralShareList& shares, const CKeyID&
 // the funding prevouts, all outputs, the full share table, the penalty terms, and the
 // registrar configuration. joinSigs sign this digest.
 uint256 ComputeSharedRegConsentHash(const CProRegTx& proTx, const CTransaction& tx);
+
+// ProDisTx (spec 4.6): the consensus-enforced dissolution that is the ONLY way the
+// template collateral can move. It refunds every participant to their immutable refund
+// script, applying the early-period penalty on a unilateral early exit.
+class CProDisTx
+{
+public:
+    static constexpr auto SPECIALTX_TYPE = TRANSACTION_PROVIDER_DISSOLVE;
+
+    uint16_t nVersion{1};
+    uint256 proTxHash;    // the shared masternode being dissolved
+    uint16_t actorIndex{0};  // index into the share table of the actor (pays penalty + fee)
+    // sigCount is implied by vecSigs.size(): 1 = unilateral, sharesCount = unanimous.
+    std::vector<std::vector<unsigned char>> vecSigs; // 65-byte compact sigs over SharedDisHash
+
+    SERIALIZE_METHODS(CProDisTx, obj)
+    {
+        READWRITE(obj.nVersion, obj.proTxHash, obj.actorIndex);
+        uint8_t sig_count{0};
+        SER_WRITE(obj, sig_count = static_cast<uint8_t>(obj.vecSigs.size()));
+        READWRITE(sig_count);
+        SER_READ(obj, obj.vecSigs.assign(sig_count, std::vector<unsigned char>(SharedCollateral::COMPACT_SIG_SIZE)));
+        for (auto& sig : obj.vecSigs) {
+            SER_WRITE(obj, if (sig.size() != SharedCollateral::COMPACT_SIG_SIZE) throw std::ios_base::failure("ProDisTx sig must be 65 bytes"));
+            READWRITE(Span{sig});
+        }
+    }
+
+    std::string ToString() const;
+    [[nodiscard]] UniValue ToJson() const;
+};
+
+// ProUpShareTx (spec 4.7): updates exactly one share's rewardScript; everything else
+// about the share is immutable for the life of the masternode.
+class CProUpShareTx
+{
+public:
+    static constexpr auto SPECIALTX_TYPE = TRANSACTION_PROVIDER_UPDATE_SHARE;
+
+    uint16_t nVersion{1};
+    uint256 proTxHash;
+    uint16_t shareIndex{0};
+    CScript rewardScript;   // new reward script (P2PKH/P2SH), or empty for "use refundScript"
+    uint256 inputsHash;
+    std::vector<unsigned char> vchSig; // by shares[shareIndex].ownerKeyID over the payload hash
+
+    SERIALIZE_METHODS(CProUpShareTx, obj)
+    {
+        READWRITE(obj.nVersion, obj.proTxHash, obj.shareIndex, obj.rewardScript, obj.inputsHash);
+        if (!(s.GetType() & SER_GETHASH)) {
+            READWRITE(obj.vchSig);
+        }
+    }
+
+    std::string ToString() const;
+    [[nodiscard]] UniValue ToJson() const;
+};
+
+// SharedDisHash (spec 4.6): commits to the transaction's actual input and outputs directly,
+// plus proTxHash, actorIndex, and sigCount (which selects the mode). The empty-scriptSig
+// rule plus low-S signatures pin every free byte, making the ProDisTx txid non-malleable.
+uint256 ComputeSharedDisHash(const CProDisTx& disTx, const CTransaction& tx, uint8_t sigCount);
 
 #endif // BITCOIN_EVO_SHAREDCOLLATERAL_H

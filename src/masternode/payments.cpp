@@ -71,16 +71,36 @@ CAmount PlatformShare(const CAmount reward)
         masternodeReward -= operatorReward;
     }
 
-    const auto owner_payouts = GetOwnerPayouts(dmnPayee->pdmnState->nVersion, dmnPayee->pdmnState->scriptPayout,
-                                               dmnPayee->pdmnState->payouts);
-    CAmount paid_owner_reward{0};
-    for (size_t i = 0; i < owner_payouts.size(); ++i) {
-        const bool last = i + 1 == owner_payouts.size();
-        const CAmount payout_amount = last ? masternodeReward - paid_owner_reward
-                                           : (masternodeReward * owner_payouts[i].reward) / CMasternodePayoutShare::MAX_REWARD;
-        paid_owner_reward += payout_amount;
-        if (payout_amount > 0) {
-            voutMasternodePaymentsRet.emplace_back(payout_amount, owner_payouts[i].scriptPayout);
+    if (!dmnPayee->pdmnState->shares.empty()) {
+        // dips#187: a shared masternode derives its owner payouts from the share table,
+        // amount-weighted, using DIP-0026's single rounding convention (sequential floor,
+        // remainder to the last entry). Destination is the reward script if set, else refund.
+        const auto& shares = dmnPayee->pdmnState->shares;
+        CAmount collateral{0};
+        for (const auto& s : shares) collateral += s.amount;
+        CAmount paid_owner_reward{0};
+        for (size_t i = 0; i < shares.size(); ++i) {
+            const bool last = i + 1 == shares.size();
+            const CAmount payout_amount = last ? masternodeReward - paid_owner_reward
+                                               : (masternodeReward * shares[i].amount) / collateral;
+            paid_owner_reward += payout_amount;
+            if (payout_amount > 0) {
+                const CScript& dest = shares[i].rewardScript.empty() ? shares[i].refundScript : shares[i].rewardScript;
+                voutMasternodePaymentsRet.emplace_back(payout_amount, dest);
+            }
+        }
+    } else {
+        const auto owner_payouts = GetOwnerPayouts(dmnPayee->pdmnState->nVersion, dmnPayee->pdmnState->scriptPayout,
+                                                   dmnPayee->pdmnState->payouts);
+        CAmount paid_owner_reward{0};
+        for (size_t i = 0; i < owner_payouts.size(); ++i) {
+            const bool last = i + 1 == owner_payouts.size();
+            const CAmount payout_amount = last ? masternodeReward - paid_owner_reward
+                                               : (masternodeReward * owner_payouts[i].reward) / CMasternodePayoutShare::MAX_REWARD;
+            paid_owner_reward += payout_amount;
+            if (payout_amount > 0) {
+                voutMasternodePaymentsRet.emplace_back(payout_amount, owner_payouts[i].scriptPayout);
+            }
         }
     }
     if (operatorReward > 0) {

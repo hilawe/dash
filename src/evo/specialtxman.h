@@ -103,6 +103,11 @@ bool CheckProUpRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> p
                      TxValidationState& state, bool check_sigs);
 bool CheckProUpRevTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev, CDeterministicMNManager& dmnman,
                      const ChainstateManager& chainman, TxValidationState& state, bool check_sigs);
+// dips#187 shared-collateral covenant
+bool CheckProDisTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev, CDeterministicMNManager& dmnman,
+                   const ChainstateManager& chainman, TxValidationState& state, bool check_sigs);
+bool CheckProUpShareTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev, CDeterministicMNManager& dmnman,
+                       const ChainstateManager& chainman, TxValidationState& state, bool check_sigs);
 
 
 /**

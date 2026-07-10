@@ -14,6 +14,7 @@
 #include <primitives/transaction.h>
 #include <script/standard.h>
 #include <tinyformat.h>
+#include <univalue.h>
 #include <util/strencodings.h>
 
 #include <set>
@@ -133,4 +134,60 @@ uint256 ComputeSharedRegConsentHash(const CProRegTx& proTx, const CTransaction& 
     hw << proTx.nEarlyPeriodBlocks;
     hw << proTx.nEarlyPenalty;
     return hw.GetHash();
+}
+
+uint256 ComputeSharedDisHash(const CProDisTx& disTx, const CTransaction& tx, uint8_t sigCount)
+{
+    // spec 4.6: "DashSharedMNDissolve" || payload version || tx version || tx type ||
+    // tx nLockTime || all input prevouts || all input sequences || all outputs ||
+    // proTxHash || actorIndex || sigCount
+    CHashWriter hw(SER_GETHASH, CLIENT_VERSION);
+    hw << std::string("DashSharedMNDissolve");
+    hw << disTx.nVersion;
+    hw << tx.nVersion;
+    hw << tx.nType;
+    hw << tx.nLockTime;
+    for (const auto& in : tx.vin) hw << in.prevout;
+    for (const auto& in : tx.vin) hw << in.nSequence;
+    for (const auto& out : tx.vout) hw << out;
+    hw << disTx.proTxHash;
+    hw << disTx.actorIndex;
+    hw << sigCount;
+    return hw.GetHash();
+}
+
+std::string CProDisTx::ToString() const
+{
+    return strprintf("CProDisTx(nVersion=%d, proTxHash=%s, actorIndex=%d, sigCount=%d)",
+                     nVersion, proTxHash.ToString(), actorIndex, vecSigs.size());
+}
+
+UniValue CProDisTx::ToJson() const
+{
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("version", nVersion);
+    ret.pushKV("proTxHash", proTxHash.ToString());
+    ret.pushKV("actorIndex", actorIndex);
+    ret.pushKV("sigCount", (uint64_t)vecSigs.size());
+    ret.pushKV("mode", vecSigs.size() == 1 ? "unilateral" : "unanimous");
+    return ret;
+}
+
+std::string CProUpShareTx::ToString() const
+{
+    return strprintf("CProUpShareTx(nVersion=%d, proTxHash=%s, shareIndex=%d)",
+                     nVersion, proTxHash.ToString(), shareIndex);
+}
+
+UniValue CProUpShareTx::ToJson() const
+{
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("version", nVersion);
+    ret.pushKV("proTxHash", proTxHash.ToString());
+    ret.pushKV("shareIndex", shareIndex);
+    if (CTxDestination d; !rewardScript.empty() && ExtractDestination(rewardScript, d)) {
+        ret.pushKV("rewardAddress", EncodeDestination(d));
+    }
+    ret.pushKV("inputsHash", inputsHash.ToString());
+    return ret;
 }

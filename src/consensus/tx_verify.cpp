@@ -9,6 +9,7 @@
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
 #include <evo/assetlocktx.h>
+#include <evo/sharedcollateral.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <tinyformat.h>
@@ -172,11 +173,20 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                          strprintf("%s: inputs missing/spent", __func__));
     }
 
+    // dips#187 collateral spend enforcement (spec 4.11): the shared-collateral template is
+    // anyone-can-spend at the script layer, so consensus restricts it to ProDisTx. A constant
+    // exact-script comparison per input; the masternode-list lookup happens inside CheckProDisTx.
+    const bool isDissolve = tx.IsSpecialTxVersion() && tx.nType == TRANSACTION_PROVIDER_DISSOLVE;
+
     CAmount nValueIn = 0;
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
         const COutPoint &prevout = tx.vin[i].prevout;
         const Coin& coin = inputs.AccessCoin(prevout);
         assert(!coin.IsSpent());
+
+        if (SharedCollateral::IsTemplateScript(coin.out.scriptPubKey) && !isDissolve) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-txns-template-spend");
+        }
 
         // If prev is coinbase, check that it's matured
         if (coin.IsCoinBase() && nSpendHeight - coin.nHeight < COINBASE_MATURITY) {
@@ -188,6 +198,18 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         nValueIn += coin.out.nValue;
         if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
+        }
+    }
+
+    // Creation check (spec 4.11): a template output may only be created as the collateral
+    // slot of a shared registration. Its exact position and uniqueness are enforced in
+    // CheckProRegTx; here any template output outside a shared registration is rejected.
+    const bool isSharedReg = tx.IsSpecialTxVersion() && tx.nType == TRANSACTION_PROVIDER_REGISTER;
+    if (!isSharedReg) {
+        for (const auto& out : tx.vout) {
+            if (SharedCollateral::IsTemplateScript(out.scriptPubKey)) {
+                return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-txns-template-create");
+            }
         }
     }
 

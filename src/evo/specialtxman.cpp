@@ -205,6 +205,10 @@ static bool CheckSpecialTxInner(CDeterministicMNManager& dmnman, llmq::CQuorumSn
             return CheckAssetLockTx(tx, state);
         case TRANSACTION_ASSET_UNLOCK:
             return CheckAssetUnlockTx(chainman.m_blockman, qman, tx, pindexPrev, indexes, state);
+        case TRANSACTION_PROVIDER_DISSOLVE:
+            return CheckProDisTx(tx, pindexPrev, dmnman, chainman, state, check_sigs);
+        case TRANSACTION_PROVIDER_UPDATE_SHARE:
+            return CheckProUpShareTx(tx, pindexPrev, dmnman, chainman, state, check_sigs);
         }
     } catch (const std::exception& e) {
         LogPrintf("%s -- failed: %s\n", __func__, e.what());
@@ -1072,6 +1076,12 @@ bool CheckProRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
         if (shareSum != expectedCollateral) {
             return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-collateral-sum");
         }
+        // the template may appear only as this one collateral output (spec 4.11 creation rule)
+        for (size_t i = 0; i < tx.vout.size(); ++i) {
+            if (SharedCollateral::IsTemplateScript(tx.vout[i].scriptPubKey) && i != opt_ptx->collateralOutpoint.n) {
+                return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-collateral-extra");
+            }
+        }
         collateralOutpoint = COutPoint(tx.GetHash(), opt_ptx->collateralOutpoint.n);
     } else if (!opt_ptx->collateralOutpoint.hash.IsNull()) {
         Coin coin;
@@ -1200,6 +1210,168 @@ bool CheckProRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
         }
     }
 
+    return true;
+}
+
+bool CheckProDisTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev,
+                   CDeterministicMNManager& dmnman, const ChainstateManager& chainman,
+                   TxValidationState& state, bool check_sigs)
+{
+    // dips#187 ProDisTx: the only transaction permitted to spend template collateral. It
+    // refunds every participant to their immutable refund script, applying the early-period
+    // penalty on a unilateral early exit. Because the refund destinations are covenant-fixed
+    // and nothing is pre-signed against the funding txid, a dishonest co-funder cannot
+    // redirect another participant's principal (this is the exit path that closes co-signer malleability).
+    if (!DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_V24)) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-prodistx-inactive");
+    }
+    const auto opt_dis = GetTxPayload<CProDisTx>(tx);
+    if (!opt_dis) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-payload");
+    }
+    if (opt_dis->nVersion == 0 || opt_dis->nVersion > 1) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-version");
+    }
+
+    auto mnList = dmnman.GetListForBlock(pindexPrev);
+    auto dmn = mnList.GetMN(opt_dis->proTxHash);
+    if (!dmn || dmn->pdmnState->shares.empty()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-mn");
+    }
+    const auto& shares = dmn->pdmnState->shares;
+    const uint16_t sharesCount = static_cast<uint16_t>(shares.size());
+
+    // exactly one input: the collateral outpoint, with an empty scriptSig
+    if (tx.vin.size() != 1 || tx.vin[0].prevout != dmn->collateralOutpoint) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-input");
+    }
+    if (!tx.vin[0].scriptSig.empty()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-scriptsig");
+    }
+
+    if (opt_dis->actorIndex >= sharesCount) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-actor");
+    }
+    const uint8_t sigCount = static_cast<uint8_t>(opt_dis->vecSigs.size());
+    const bool unanimous = (sigCount == sharesCount);
+    const bool unilateral = (sigCount == 1);
+    if (!unanimous && !unilateral) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-sigcount");
+    }
+
+    // penalty math (spec 4.6). spendHeight is the height of the block containing this tx.
+    const int spendHeight = pindexPrev->nHeight + 1;
+    const bool early = (spendHeight - dmn->pdmnState->nRegisteredHeight) < (int)dmn->pdmnState->nEarlyPeriodBlocks;
+    const CAmount requiredPenalty = (unanimous || !early) ? 0 : dmn->pdmnState->nEarlyPenalty;
+
+    // output rules (spec 4.6): one output per non-actor share i paying shares[i].refundScript
+    // in share order, optionally one final actor output. Minimum-based: overpaying is valid.
+    const uint16_t a = opt_dis->actorIndex;
+    CAmount W{0};
+    for (uint16_t i = 0; i < sharesCount; ++i) if (i != a) W += shares[i].amount;
+
+    size_t nonActorCount = sharesCount - 1;
+    if (tx.vout.size() < nonActorCount || tx.vout.size() > nonActorCount + 1) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-outcount");
+    }
+    CAmount bonusSum{0};
+    size_t outIdx = 0;
+    for (uint16_t i = 0; i < sharesCount; ++i) {
+        if (i == a) continue;
+        const CTxOut& out = tx.vout[outIdx];
+        if (out.scriptPubKey != shares[i].refundScript) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-refund-script");
+        }
+        const CAmount bonus = out.nValue - shares[i].amount;
+        const CAmount minBonus = W > 0 ? (requiredPenalty * shares[i].amount) / W : 0; // element-wise floor
+        if (bonus < minBonus) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-refund-min");
+        }
+        bonusSum += bonus;
+        ++outIdx;
+    }
+    if (bonusSum < requiredPenalty) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-penalty");
+    }
+    // optional actor output must pay the actor's refund script
+    if (tx.vout.size() == nonActorCount + 1) {
+        if (tx.vout.back().scriptPubKey != shares[a].refundScript) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-actor-script");
+        }
+    }
+
+    if (check_sigs) {
+        const uint256 disHash = ComputeSharedDisHash(*opt_dis, tx, sigCount);
+        std::string strError;
+        if (unilateral) {
+            if (!CHashSigner::VerifyHash(disHash, shares[a].ownerKeyID, opt_dis->vecSigs[0], strError)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-prodistx-sig");
+            }
+        } else {
+            for (uint16_t i = 0; i < sharesCount; ++i) {
+                if (!CHashSigner::VerifyHash(disHash, shares[i].ownerKeyID, opt_dis->vecSigs[i], strError)) {
+                    return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-prodistx-sig");
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool CheckProUpShareTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev,
+                       CDeterministicMNManager& dmnman, const ChainstateManager& chainman,
+                       TxValidationState& state, bool check_sigs)
+{
+    // dips#187 ProUpShareTx: updates exactly one share's rewardScript with that share owner's
+    // signature. Every other share field is immutable for the life of the masternode.
+    if (!DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_V24)) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-proupsharetx-inactive");
+    }
+    const auto opt_ptx = GetTxPayload<CProUpShareTx>(tx);
+    if (!opt_ptx) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-payload");
+    }
+    if (opt_ptx->nVersion == 0 || opt_ptx->nVersion > 1) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-version");
+    }
+
+    auto mnList = dmnman.GetListForBlock(pindexPrev);
+    auto dmn = mnList.GetMN(opt_ptx->proTxHash);
+    if (!dmn || dmn->pdmnState->shares.empty()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-mn");
+    }
+    const auto& shares = dmn->pdmnState->shares;
+    if (opt_ptx->shareIndex >= shares.size()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-index");
+    }
+    // the new reward script is subject to the same restrictions as at registration
+    if (!opt_ptx->rewardScript.empty()) {
+        if (!opt_ptx->rewardScript.IsPayToPublicKeyHash() && !opt_ptx->rewardScript.IsPayToScriptHash()) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-reward");
+        }
+        if (SharedCollateral::IsTemplateScript(opt_ptx->rewardScript)) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-template-dest");
+        }
+        CTxDestination dest;
+        if (ExtractDestination(opt_ptx->rewardScript, dest)) {
+            for (const auto& share : shares) {
+                if (dest == CTxDestination(PKHash(share.ownerKeyID))) {
+                    return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-key-reuse");
+                }
+            }
+            if (dest == CTxDestination(PKHash(dmn->pdmnState->keyIDVoting))) {
+                return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharetx-key-reuse");
+            }
+        }
+    }
+
+    if (!CheckInputsHash(tx, *opt_ptx, state)) {
+        return false;
+    }
+    if (check_sigs && !CheckHashSig(*opt_ptx, PKHash(shares[opt_ptx->shareIndex].ownerKeyID), state)) {
+        return false;
+    }
     return true;
 }
 
