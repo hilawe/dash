@@ -296,6 +296,10 @@ bool CSpecialTxProcessor::RebuildListFromBlock(const CBlock& block, gsl::not_nul
     // EVERY transaction including the coinbase, so a template output cannot be created outside a
     // shared registration and template collateral cannot be spent except by a ProDisTx.
     if (is_v24_deployed) {
+        // `view` reflects the pre-block UTXO set, so it does not see a template output created
+        // earlier in THIS block. Track those outpoints in transaction order so a same-block
+        // create-then-spend by a non-ProDisTx is still caught.
+        std::set<COutPoint> block_template_outpoints;
         for (const auto& ptx : block.vtx) {
             // vtx[0] is a null placeholder while CreateNewBlock is still assembling our own
             // coinbase; at block CONNECTION every entry (coinbase included) is populated and
@@ -304,6 +308,19 @@ bool CSpecialTxProcessor::RebuildListFromBlock(const CBlock& block, gsl::not_nul
             TxValidationState tx_state;
             if (!CheckTemplateSpendCreation(*ptx, view, tx_state)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason());
+            }
+            const bool isDissolve = ptx->IsSpecialTxVersion() && ptx->nType == TRANSACTION_PROVIDER_DISSOLVE;
+            if (!isDissolve && !ptx->IsCoinBase()) {
+                for (const auto& in : ptx->vin) {
+                    if (block_template_outpoints.count(in.prevout)) {
+                        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-template-spend");
+                    }
+                }
+            }
+            for (size_t n = 0; n < ptx->vout.size(); ++n) {
+                if (SharedCollateral::IsTemplateScript(ptx->vout[n].scriptPubKey)) {
+                    block_template_outpoints.emplace(ptx->GetHash(), n);
+                }
             }
         }
     }
