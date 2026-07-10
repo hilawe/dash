@@ -9,6 +9,7 @@
 #include <evo/mnhftx.h>
 #include <evo/netinfo.h>
 #include <evo/providertx.h>
+#include <evo/sharedcollateral.h>
 #include <evo/simplifiedmns.h>
 #include <evo/smldiff.h>
 #include <llmq/commitment.h>
@@ -365,6 +366,30 @@ UniValue CProRegTx::ToJson() const
             ret.pushKV("platformP2PPort", GetPlatformPort</*is_p2p=*/true>(*this));
             ret.pushKV("platformHTTPPort", GetPlatformPort</*is_p2p=*/false>(*this));
         }
+    }
+    ret.pushKV("inputsHash", inputsHash.ToString());
+    return ret;
+}
+
+UniValue CProDisTx::ToJson() const
+{
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("version", nVersion);
+    ret.pushKV("proTxHash", proTxHash.ToString());
+    ret.pushKV("actorIndex", actorIndex);
+    ret.pushKV("sigCount", (uint64_t)vecSigs.size());
+    ret.pushKV("mode", vecSigs.size() == 1 ? "unilateral" : "unanimous");
+    return ret;
+}
+
+UniValue CProUpShareTx::ToJson() const
+{
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("version", nVersion);
+    ret.pushKV("proTxHash", proTxHash.ToString());
+    ret.pushKV("shareIndex", shareIndex);
+    if (CTxDestination d; !rewardScript.empty() && ExtractDestination(rewardScript, d)) {
+        ret.pushKV("rewardAddress", EncodeDestination(d));
     }
     ret.pushKV("inputsHash", inputsHash.ToString());
     return ret;

@@ -210,16 +210,8 @@ std::string CProDisTx::ToString() const
                      nVersion, proTxHash.ToString(), actorIndex, vecSigs.size());
 }
 
-UniValue CProDisTx::ToJson() const
-{
-    UniValue ret(UniValue::VOBJ);
-    ret.pushKV("version", nVersion);
-    ret.pushKV("proTxHash", proTxHash.ToString());
-    ret.pushKV("actorIndex", actorIndex);
-    ret.pushKV("sigCount", (uint64_t)vecSigs.size());
-    ret.pushKV("mode", vecSigs.size() == 1 ? "unilateral" : "unanimous");
-    return ret;
-}
+// CProDisTx::ToJson() defined in evo/core_write.cpp (libbitcoin_common, like the other
+// special-tx payload JSON writers, so that common-layer consumers like dash-tx link)
 
 std::string CProUpShareTx::ToString() const
 {
@@ -227,15 +219,4 @@ std::string CProUpShareTx::ToString() const
                      nVersion, proTxHash.ToString(), shareIndex);
 }
 
-UniValue CProUpShareTx::ToJson() const
-{
-    UniValue ret(UniValue::VOBJ);
-    ret.pushKV("version", nVersion);
-    ret.pushKV("proTxHash", proTxHash.ToString());
-    ret.pushKV("shareIndex", shareIndex);
-    if (CTxDestination d; !rewardScript.empty() && ExtractDestination(rewardScript, d)) {
-        ret.pushKV("rewardAddress", EncodeDestination(d));
-    }
-    ret.pushKV("inputsHash", inputsHash.ToString());
-    return ret;
-}
+// CProUpShareTx::ToJson() defined in evo/core_write.cpp (see the note above)
