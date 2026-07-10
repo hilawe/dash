@@ -185,14 +185,14 @@ class TegaraRetailVerticalTest(DashTestFramework):
 
         assert protx_hash not in [d["proTxHash"] for d in node.protx("list", "registered", True)]
 
-        pays = {o["scriptPubKey"]["address"]: o["value"] for o in dis["vout"]
+        pays = {o["scriptPubKey"]["address"]: int(o["value"] * COIN) for o in dis["vout"]
                 if "address" in o["scriptPubKey"]}
         # the passive group slot: full principal plus the whole penalty bonus (single
-        # non-actor), at its immutable refund address
-        assert_equal(int(round(pays[group_refund])), 600 + early_penalty)
-        # the actor: principal minus the penalty and the flat fee
-        assert_greater_than(pays[coowner_refund], 394)
-        assert_greater_than(395, pays[coowner_refund])
+        # non-actor), at its immutable refund address, exact to the duff
+        assert_equal(pays[group_refund], (600 + early_penalty) * COIN)
+        # the actor: principal minus the penalty and the flat dissolution fee (the RPC
+        # default, 100000 duffs), exact to the duff
+        assert_equal(pays[coowner_refund], 400 * COIN - early_penalty * COIN - 100000)
 
         self.log.info("retail vertical, L1 half, demonstrated: the group slot earned "
                       "consensus-paid rewards to its designated reward address, and its "
