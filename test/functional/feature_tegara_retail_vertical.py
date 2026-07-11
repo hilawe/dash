@@ -142,35 +142,47 @@ class TegaraRetailVerticalTest(DashTestFramework):
         out_path = os.environ.get(
             "TEGARA_EPOCH_OUT",
             os.path.join(self.options.tmpdir, "tegara_epoch_observation.json"))
-        observation = {
-            "version": 1,
-            "network": "fork-regtest",
-            "source": "feature_tegara_retail_vertical.py",
-            "proTxHash": protx_hash,
-            "slotIndex": 0,
-            "shareAmountDuffs": 600 * COIN,
-            "collateralDuffs": 1000 * COIN,
-            "registeredHeight": reg_height,
-            "height": pay_height,
-            "blockHash": pay_hash,
-            "coinbaseTxid": coinbase["txid"],
-            "rewardVout": g_idx,
-            "rewardAddress": group_reward,
-            "rewardScriptHex": coinbase["vout"][g_idx]["scriptPubKey"]["hex"],
-            "amountDuffs": g_amt,
-            "mnRewardDuffs": mn_reward,
-            "operatorRewardBps": 0,
-        }
-        with open(out_path, "w", encoding="utf8") as f:
-            json.dump(observation, f, indent=2, sort_keys=True)
-        self.log.info(f"epoch observation written to {out_path}")
 
-        self.log.info("rewards recur: two more blocks pay the same reward scripts")
+        def export_epoch(path, block_hash, height, cb, vout_idx, amount, total):
+            observation = {
+                "version": 1,
+                "network": "fork-regtest",
+                "source": "feature_tegara_retail_vertical.py",
+                "proTxHash": protx_hash,
+                "slotIndex": 0,
+                "shareAmountDuffs": 600 * COIN,
+                "collateralDuffs": 1000 * COIN,
+                "registeredHeight": reg_height,
+                "height": height,
+                "blockHash": block_hash,
+                "coinbaseTxid": cb["txid"],
+                "rewardVout": vout_idx,
+                "rewardAddress": group_reward,
+                "rewardScriptHex": cb["vout"][vout_idx]["scriptPubKey"]["hex"],
+                "amountDuffs": amount,
+                "mnRewardDuffs": total,
+                "operatorRewardBps": 0,
+            }
+            with open(path, "w", encoding="utf8") as f:
+                json.dump(observation, f, indent=2, sort_keys=True)
+            self.log.info(f"epoch observation written to {path}")
+
+        export_epoch(out_path, pay_hash, pay_height, coinbase, g_idx, g_amt, mn_reward)
+
+        self.log.info("rewards recur: two more blocks pay the same reward scripts, each "
+                      "exported as its own epoch (the multi-epoch feed for the scale run)")
+        base, ext = os.path.splitext(out_path)
         for _ in range(2):
             self.bump_mocktime(1)
             bh = self.generate(node, 1, sync_fun=self.no_op)[0]
-            _, more = self.coinbase_payouts(bh)
+            cb2, more = self.coinbase_payouts(bh)
             assert group_reward in more and coowner_refund in more
+            h2 = node.getblockcount()
+            i2, a2 = more[group_reward]
+            _, c2 = more[coowner_refund]
+            # same shared masternode, later height: the split rule holds every epoch
+            assert_equal(a2, (a2 + c2) * 600 // 1000)
+            export_epoch(f"{base}-h{h2}{ext}", bh, h2, cb2, i2, a2, a2 + c2)
 
         self.log.info("resilience: slot 1 dissolves unilaterally; the group and its "
                       "coordinator take no action and no Layer 2 exists on this chain")
