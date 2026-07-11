@@ -135,6 +135,7 @@ BASE_SCRIPTS = [
     'feature_masternode_payout_shares.py',
     'feature_tegara_shared_collateral.py',
     'feature_tegara_retail_vertical.py',
+    'feature_tegara_dissolve_negatives.py',
     'feature_llmq_signing.py', # NOTE: needs dash_hash to pass
     'feature_llmq_signing.py --spork21', # NOTE: needs dash_hash to pass
     'feature_llmq_rotation.py', # NOTE: needs dash_hash to pass

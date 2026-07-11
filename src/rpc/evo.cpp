@@ -2279,8 +2279,9 @@ static RPCHelpMan protx_shared_dissolve()
             {"actorIndex", RPCArg::Type::NUM, RPCArg::Optional::NO, "Index into the share table of the actor"},
             {"mode", RPCArg::Type::STR, RPCArg::Default{"unilateral"}, "\"unilateral\" or \"unanimous\""},
             {"feeDuffs", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Flat fee in duffs (default 100000), paid from the actor's share"},
+            {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (for building negative test cases)"},
         },
-        RPCResult{RPCResult::Type::STR_HEX, "txid", "The transaction id"},
+        RPCResult{RPCResult::Type::STR_HEX, "txid_or_hex", "The transaction id, or the signed tx hex when submit is false"},
         RPCExamples{""},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -2297,6 +2298,7 @@ static RPCHelpMan protx_shared_dissolve()
     disTx.actorIndex = request.params[1].getInt<int>();
     const std::string mode = request.params[2].isNull() ? "unilateral" : request.params[2].get_str();
     const CAmount fee = request.params[3].isNull() ? 100000 : request.params[3].getInt<int64_t>();
+    const bool submit = request.params[4].isNull() ? true : request.params[4].get_bool();
 
     auto dmn = dmnman.GetListAtChainTip().GetMN(disTx.proTxHash);
     if (!dmn || dmn->pdmnState->shares.empty()) {
@@ -2376,6 +2378,11 @@ static RPCHelpMan protx_shared_dissolve()
     }
     CDataStream ds(SER_NETWORK, PROTOCOL_VERSION);
     ds << tx;
+    if (!submit) {
+        // return the valid signed hex so a caller can mutate one field and submit it raw
+        // to exercise a specific consensus rejection (negative tests)
+        return HexStr(ds);
+    }
     JSONRPCRequest sendRequest(request);
     sendRequest.params.setArray();
     sendRequest.params.push_back(HexStr(ds));
