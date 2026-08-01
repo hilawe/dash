@@ -322,6 +322,13 @@ static MasternodePayoutShares ParsePayouts(const UniValue& value, const std::str
 // Funds from coins held at ANY of fundDests, with change to the first. The multi-destination form
 // exists because a shared registration is genuinely multi-party: funding it from one address means
 // one key signs every input, which cannot represent two participants contributing independently.
+//
+// THIS IS NOT A MULTI-PARTY FUNDING POLICY, and must not be mistaken for one. It does not require an
+// input from every listed destination, and all change goes to the first. A caller who needs each
+// participant to contribute a specific amount, pay a share of the fee, and receive their own change
+// has to arrange that outside this function, by choosing coin amounts that force the selection it
+// wants. That is what the malleability test does. Real participants holding their own keys in their
+// own wallets need a coordinated multi-signer construction, which this prototype does not attempt.
 template <typename SpecialTxPayload>
 static void FundSpecialTx(CWallet& wallet, CMutableTransaction& tx, const SpecialTxPayload& payload,
                           const std::vector<CTxDestination>& fundDests) EXCLUSIVE_LOCKS_REQUIRED(!wallet.cs_wallet)
@@ -2189,7 +2196,7 @@ static RPCHelpMan protx_shared_register()
             {"operatorReward", RPCArg::Type::NUM, RPCArg::Optional::NO, "Operator reward in percent (0-100)"},
             {"earlyPeriodBlocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "Length of the early period in blocks"},
             {"earlyPenalty", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Unilateral early-exit penalty (< min share)"},
-            {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund collateral and fee from, or a JSON array of addresses. An array funds the collateral from several separately controlled coins, which is what a genuinely multi-party registration looks like; change goes to the first"},
+            {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund collateral and fee from, or a JSON array of addresses. An array funds the collateral from several separately controlled coins, which is what a genuinely multi-party registration looks like. NOTE this is not a multi-party funding policy: an input is not required from every address listed, and all change goes to the first, so a caller wanting a specific contribution per participant must force it through the coin amounts"},
             {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (lets a caller re-sign an input and submit the variant, to exercise transaction-identifier malleability). NOTE the selected inputs are NOT reserved: a second call, or any other wallet spend, can select the same coins and leave the returned hex unspendable. Normal raw-transaction behaviour, but it makes this flag regtest/devnet-only in practice"},
         },
         RPCResult{RPCResult::Type::STR_HEX, "txid_or_hex", "The transaction id, or the signed tx hex when submit is false"},
