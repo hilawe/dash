@@ -2177,8 +2177,9 @@ static RPCHelpMan protx_shared_register()
             {"earlyPeriodBlocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "Length of the early period in blocks"},
             {"earlyPenalty", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Unilateral early-exit penalty (< min share)"},
             {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund collateral and fee from"},
+            {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (lets a caller re-sign an input and submit the variant, to exercise transaction-identifier malleability)"},
         },
-        RPCResult{RPCResult::Type::STR_HEX, "txid", "The transaction id"},
+        RPCResult{RPCResult::Type::STR_HEX, "txid_or_hex", "The transaction id, or the signed tx hex when submit is false"},
         RPCExamples{""},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -2263,7 +2264,83 @@ static RPCHelpMan protx_shared_register()
     }
 
     SetTxPayload(tx, ptx);
-    return SignAndSendSpecialTx(request, chain_helper, chainman, tx, /*fSubmit=*/true);
+    const bool submit = request.params[7].isNull() ? true : request.params[7].get_bool();
+    return SignAndSendSpecialTx(request, chain_helper, chainman, tx, submit);
+},
+    };
+}
+
+// ProUpShareTx builder (spec 4.7). Rotates ONE share's reward script under that share owner's
+// signature; every other share field is immutable for the life of the masternode, which
+// CheckProUpShareTx enforces. Regtest/devnet prototype constructor only: the trustlessness is a
+// property of the consensus rules, not of this RPC, which merely assembles and signs.
+static RPCHelpMan protx_share_update()
+{
+    return RPCHelpMan{"protxupdateshare",
+        "\nBuild, fund, sign, and submit a ProUpShareTx updating one share's reward script (dips#187).\n"
+        "The wallet must hold that share's owner key. Regtest/devnet prototype.\n",
+        {
+            {"proTxHash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The shared masternode's ProRegTx hash"},
+            {"shareIndex", RPCArg::Type::NUM, RPCArg::Optional::NO, "Index into the share table of the share to update"},
+            {"rewardAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "The new reward address, or \"\" to fall back to the share's refund script"},
+            {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund the fee from"},
+            {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (for building negative test cases)"},
+        },
+        RPCResult{RPCResult::Type::STR_HEX, "txid_or_hex", "The transaction id, or the signed tx hex when submit is false"},
+        RPCExamples{""},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const NodeContext& node = EnsureAnyNodeContext(request.context);
+    const ChainstateManager& chainman = EnsureChainman(node);
+    CChainstateHelper& chain_helper = *CHECK_NONFATAL(node.chain_helper);
+    CDeterministicMNManager& dmnman = *CHECK_NONFATAL(node.dmnman);
+
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    EnsureWalletIsUnlocked(*pwallet);
+
+    CProUpShareTx ptx;
+    ptx.proTxHash = ParseHashV(request.params[0], "proTxHash");
+
+    auto dmn = dmnman.GetListAtChainTip().GetMN(ptx.proTxHash);
+    if (!dmn || dmn->pdmnState->shares.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "not a shared masternode");
+    }
+    const auto& shares = dmn->pdmnState->shares;
+    const int shareIndex = request.params[1].getInt<int>();
+    if (shareIndex < 0 || shareIndex >= (int)shares.size()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "shareIndex out of range");
+    }
+    ptx.shareIndex = static_cast<uint16_t>(shareIndex);
+
+    // an empty reward address is the spec's "fall back to refundScript" encoding, so it stays
+    // an empty script rather than being rejected as an invalid address
+    const std::string rewardStr = request.params[2].get_str();
+    if (!rewardStr.empty()) {
+        CTxDestination rewardDest = DecodeDestination(rewardStr);
+        if (!IsValidDestination(rewardDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid reward address");
+        ptx.rewardScript = GetScriptForDestination(rewardDest);
+    }
+
+    CTxDestination fundDest = DecodeDestination(request.params[3].get_str());
+    if (!IsValidDestination(fundDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid fund address");
+
+    CMutableTransaction tx;
+    tx.nVersion = 3;
+    tx.nType = TRANSACTION_PROVIDER_UPDATE_SHARE;
+
+    // pre-size the signature so the funding fee accounts for it: the payload is serialized into
+    // the transaction during funding, but the signature is only produced afterwards, and without
+    // this the transaction is short by exactly the signature's bytes and fails the relay fee
+    ptx.vchSig.resize(SharedCollateral::COMPACT_SIG_SIZE);
+    FundSpecialTx(*pwallet, tx, ptx, fundDest);
+    // signs by the SHARE OWNER key, which is the only key that may move this share's reward
+    // script; the helper refreshes inputsHash first so the signature covers the funded inputs
+    SignSpecialTxPayloadByHash(tx, ptx, shares[ptx.shareIndex].ownerKeyID, *pwallet);
+    SetTxPayload(tx, ptx);
+
+    const bool submit = request.params[4].isNull() ? true : request.params[4].get_bool();
+    return SignAndSendSpecialTx(request, chain_helper, chainman, tx, submit);
 },
     };
 }
@@ -2409,6 +2486,7 @@ Span<const CRPCCommand> GetWalletEvoRPCCommands()
         {"evo", &protx_revoke},
         {"evo", &protx_shared_register},
         {"evo", &protx_shared_dissolve},
+        {"evo", &protx_share_update},
         {"hidden", &protx_register_legacy},
         {"hidden", &protx_register_fund_legacy},
         {"hidden", &protx_register_prepare_legacy},
