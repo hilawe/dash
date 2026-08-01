@@ -2177,7 +2177,7 @@ static RPCHelpMan protx_shared_register()
             {"earlyPeriodBlocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "Length of the early period in blocks"},
             {"earlyPenalty", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Unilateral early-exit penalty (< min share)"},
             {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund collateral and fee from"},
-            {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (lets a caller re-sign an input and submit the variant, to exercise transaction-identifier malleability)"},
+            {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (lets a caller re-sign an input and submit the variant, to exercise transaction-identifier malleability). NOTE the selected inputs are NOT reserved: a second call, or any other wallet spend, can select the same coins and leave the returned hex unspendable. Normal raw-transaction behaviour, but it makes this flag regtest/devnet-only in practice"},
         },
         RPCResult{RPCResult::Type::STR_HEX, "txid_or_hex", "The transaction id, or the signed tx hex when submit is false"},
         RPCExamples{""},

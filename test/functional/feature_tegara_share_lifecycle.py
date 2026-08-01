@@ -18,6 +18,9 @@ exercised by any test, which this test closes:
 Both run against one three-participant masternode, in lifecycle order: register, rotate a reward
 script, refuse the malformed rotations, then exit unanimously during the early period.
 """
+import struct
+
+from test_framework.messages import CTransaction, from_hex
 from test_framework.test_framework import DashTestFramework
 from test_framework.util import (
     assert_equal,
@@ -108,17 +111,48 @@ class TegaraShareLifecycleTest(DashTestFramework):
         assert_equal(state_after["earlyPeriodBlocks"], early_period)
         assert_equal(state_after["registeredHeight"], registered_height)
 
-        self.log.info("malformed rotations are refused")
-        # an index outside the share table
+        self.log.info("malformed rotations are refused by the builder")
+        # an index outside the share table. NOTE this is the BUILDER's own parameter check, not
+        # a consensus rule; the consensus rule is exercised separately below.
         assert_raises_rpc_error(-8, "shareIndex out of range",
                                 node.protxupdateshare, txid, 3, node.getnewaddress(), fund_addr)
-        # the reward script may not reuse a share owner key, which would collapse two roles
+        # the reward script may not reuse a share owner key, which would collapse two roles.
+        # These two DO reach consensus: the address is valid, so the builder emits and the
+        # pre-check returns the consensus rejection verbatim.
         assert_raises_rpc_error(None, "bad-proupsharetx-key-reuse",
                                 node.protxupdateshare, txid, 0, owners[2], fund_addr)
         # nor the voting key
         assert_raises_rpc_error(None, "bad-proupsharetx-key-reuse",
                                 node.protxupdateshare, txid, 0, voting, fund_addr)
         # a refused rotation changes nothing
+        assert_equal(node.protx("info", txid)["state"]["shares"], after)
+
+        self.log.info("consensus refuses a rotation the share owner did not authorize")
+        # Everything above would still pass if consensus stopped checking the signature at all,
+        # because the builder only ever signs with the RIGHT owner key. These two cases close
+        # that: build a valid rotation for share 0, then rewrite the share index in the payload
+        # and submit it raw. The signature was made over the payload as it stood, so it no
+        # longer authorizes what the transaction now asks for.
+        #
+        # Payload layout (CProUpShareTx): nVersion (2 bytes) + proTxHash (32) + shareIndex (2),
+        # so the index sits at offset 34, little-endian.
+        valid_hex = node.protxupdateshare(txid, 0, node.getnewaddress(), fund_addr, False)
+
+        def with_share_index(idx):
+            tx = from_hex(CTransaction(), valid_hex)
+            pl = tx.vExtraPayload
+            tx.vExtraPayload = pl[:34] + struct.pack("<H", idx) + pl[36:]
+            tx.rehash()
+            return tx.serialize().hex()
+
+        # index 1 is IN range, so the index rule passes and the signature is checked. It was made
+        # by share 0's owner over a payload naming share 0, so it does not authorize share 1.
+        assert_raises_rpc_error(-26, "bad-protx-sig", node.sendrawtransaction, with_share_index(1))
+        # index 7 is out of range, and consensus refuses it on its own rule, which is checked
+        # before the signature. This is the rule the builder's parameter check hides above.
+        assert_raises_rpc_error(-26, "bad-proupsharetx-index",
+                                node.sendrawtransaction, with_share_index(7))
+        # both refusals left the share table untouched
         assert_equal(node.protx("info", txid)["state"]["shares"], after)
 
         self.log.info("all three participants dissolve unanimously, during the early period")
@@ -137,14 +171,18 @@ class TegaraShareLifecycleTest(DashTestFramework):
         assert_equal(dis["proDisTx"]["sigCount"], 3)
         assert_equal(dis["proDisTx"]["actorIndex"], 0)
 
-        pays = {o["scriptPubKey"]["address"]: o["value"] for o in dis["vout"]
+        # exact duffs, not rounded DASH: valueSat is the integer the node recorded
+        pays = {o["scriptPubKey"]["address"]: o["valueSat"] for o in dis["vout"]
                 if "address" in o["scriptPubKey"]}
         # THE POINT OF THE UNANIMOUS MODE. No penalty applies even inside the early period, so
         # the two non-actors are paid exactly their share, with none of the bonus a unilateral
         # exit would have handed them, and the actor is short only the flat fee.
-        assert_equal(int(round(pays[refunds[1]] * COIN)), 300 * COIN)
-        assert_equal(int(round(pays[refunds[2]] * COIN)), 300 * COIN)
-        assert_equal(int(round(pays[refunds[0]] * COIN)), 400 * COIN - DISSOLVE_FEE)
+        assert_equal(pays[refunds[1]], 300 * COIN)
+        assert_equal(pays[refunds[2]], 300 * COIN)
+        assert_equal(pays[refunds[0]], 400 * COIN - DISSOLVE_FEE)
+        # nothing else was paid out: no extra output resembling a penalty redistribution
+        assert_equal(len(pays), 3)
+        assert_equal(sum(pays.values()), 1000 * COIN - DISSOLVE_FEE)
         # every participant's principal actually arrived at its own immutable refund address
         received_after = [node.getreceivedbyaddress(r, 0) for r in refunds]
         for i in range(3):

@@ -13,9 +13,13 @@ against the original identifier is then dead.
 This test runs that same mutation against a shared registration and shows the covenant does not
 care, which is the property the pre-signed construction could not provide:
 
-  - the registration is funded and signed but NOT submitted, then one input is re-signed with a
-    different signature hash, producing a different transaction identifier over identical
-    prevouts and identical outputs (the co-signer malleability mechanism);
+  - the registration is funded from TWO separate coins, so it carries two independently signed
+    inputs, standing in for two co-funders;
+  - it is signed but NOT submitted, then EXACTLY ONE input is re-signed under a different
+    signature hash while the other input keeps its original signature untouched. That is the
+    mechanism: one participant acting alone, with no cooperation from the other. The second
+    signature stays valid because a legacy signature hash blanks the other inputs' scripts, which
+    is the very reason identifier malleability exists without SegWit;
   - the VARIANT is submitted and accepted, so the joinSigs still verify: the consent digest
     binds prevouts and outputs, not the identifier;
   - the masternode registers under the variant's identifier, and the internal collateral outpoint
@@ -38,6 +42,7 @@ from test_framework.util import (
 
 V24_ACTIVATION_THRESHOLD = 100
 COIN = 100000000
+DISSOLVE_FEE = 100000  # the dissolution builder's flat default, paid from the actor's share
 
 
 class TegaraFundingMalleabilityTest(DashTestFramework):
@@ -66,7 +71,11 @@ class TegaraFundingMalleabilityTest(DashTestFramework):
         voting = node.getnewaddress()
         operator = node.bls("generate")["public"]
         fund_addr = node.getnewaddress()
-        node.sendtoaddress(fund_addr, 1001)
+        # TWO separate coins at the funding address, each too small to cover the 1000 DASH
+        # collateral alone, so the registration must spend both and carries two independently
+        # signed inputs. Those two inputs stand in for two co-funders.
+        node.sendtoaddress(fund_addr, 600)
+        node.sendtoaddress(fund_addr, 501)
         self.bump_mocktime(10 * 60 + 1)
         self.generate(node, 1, sync_fun=self.no_op)
 
@@ -86,21 +95,36 @@ class TegaraFundingMalleabilityTest(DashTestFramework):
         # nothing is on chain or in the mempool yet
         assert_raises_rpc_error(-5, "No such mempool or blockchain transaction",
                                 node.getrawtransaction, original_txid)
-        assert_greater_than(len(original.vin), 0)
+        # the two funding coins really did become two separately signed inputs, which is what
+        # makes the single-participant mutation below meaningful rather than a whole-transaction
+        # re-sign
+        assert_greater_than(len(original.vin), 1)
+        assert all(len(txin.scriptSig) > 0 for txin in original.vin)
 
-        self.log.info("re-sign one input with a different signature hash (the co-signer mutation)")
-        # clear every input script so the wallet re-signs from scratch, then sign under a
-        # DIFFERENT signature hash type. The signature bytes change, so the transaction
-        # identifier changes, while the prevouts and the outputs are untouched.
+        self.log.info("ONE participant re-signs ONLY their own input (the co-signer mutation)")
+        # Re-sign everything under a different signature hash type, then keep only input 0's new
+        # script and restore every other input's ORIGINAL signature. The result is what one
+        # co-funder acting alone can produce: their own input re-signed, nobody else's touched,
+        # no cooperation required.
         stripped = from_hex(CTransaction(), signed_hex)
         for txin in stripped.vin:
             txin.scriptSig = b""
         resigned = node.signrawtransactionwithwallet(
             stripped.serialize().hex(), [], "ALL|ANYONECANPAY")
         assert_equal(resigned["complete"], True)
-        variant = from_hex(CTransaction(), resigned["hex"])
+        all_resigned = from_hex(CTransaction(), resigned["hex"])
+
+        variant = from_hex(CTransaction(), signed_hex)
+        variant.vin[0].scriptSig = all_resigned.vin[0].scriptSig
         variant.rehash()
         variant_txid = variant.hash
+
+        # exactly one input moved, and every other participant's signature is byte-identical to
+        # what they signed. Their signatures stay VALID because a legacy signature hash blanks
+        # the other inputs' scripts, which is precisely why the identifier is malleable here.
+        assert variant.vin[0].scriptSig != original.vin[0].scriptSig
+        for i in range(1, len(original.vin)):
+            assert_equal(variant.vin[i].scriptSig, original.vin[i].scriptSig)
 
         # the mutation is real: a different identifier over identical prevouts and outputs
         assert variant_txid != original_txid, "re-signing did not change the identifier"
@@ -115,7 +139,7 @@ class TegaraFundingMalleabilityTest(DashTestFramework):
         self.log.info(f"  identifier moved {original_txid[:12]}.. -> {variant_txid[:12]}..")
 
         self.log.info("the variant is accepted and registers the masternode under ITS identifier")
-        sent = node.sendrawtransaction(resigned["hex"])
+        sent = node.sendrawtransaction(variant.serialize().hex())
         assert_equal(sent, variant_txid)
         self.bump_mocktime(10 * 60 + 1)
         self.generate(node, 1, sync_fun=self.no_op)
@@ -151,13 +175,14 @@ class TegaraFundingMalleabilityTest(DashTestFramework):
 
         assert variant_txid not in [d["proTxHash"] for d in node.protx("list", "registered", True)]
         dis = node.getrawtransaction(dis_txid, 1)
-        pays = {o["scriptPubKey"]["address"]: o["value"] for o in dis["vout"]
+        # exact duffs, not rounded DASH: valueSat is the integer the node recorded
+        pays = {o["scriptPubKey"]["address"]: o["valueSat"] for o in dis["vout"]
                 if "address" in o["scriptPubKey"]}
         # the passive participant's principal landed at the refund script recorded before the
         # mutation, in full, plus the whole early-period penalty as the single non-actor
-        assert_equal(int(round(pays[refund1])), 500 + early_penalty)
-        assert_greater_than(pays[refund0], 494)
-        assert_greater_than(495, pays[refund0])
+        assert_equal(pays[refund1], (500 + early_penalty) * COIN)
+        # the actor is short exactly the penalty and the builder's flat fee, to the duff
+        assert_equal(pays[refund0], (500 - early_penalty) * COIN - DISSOLVE_FEE)
 
         self.log.info("Co-signer mutation applied to a shared registration: the identifier changed "
                       "before confirmation and the covenant was unaffected, because refund "
