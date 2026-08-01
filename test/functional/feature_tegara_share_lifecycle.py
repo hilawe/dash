@@ -180,9 +180,11 @@ class TegaraShareLifecycleTest(DashTestFramework):
         assert_equal(pays[refunds[1]], 300 * COIN)
         assert_equal(pays[refunds[2]], 300 * COIN)
         assert_equal(pays[refunds[0]], 400 * COIN - DISSOLVE_FEE)
-        # nothing else was paid out: no extra output resembling a penalty redistribution
-        assert_equal(len(pays), 3)
-        assert_equal(sum(pays.values()), 1000 * COIN - DISSOLVE_FEE)
+        # nothing else was paid out: no extra output resembling a penalty redistribution. Count and
+        # sum the RAW vout, not the address-keyed map above, which would collapse two outputs paying
+        # the same address and drop any output with no address at all.
+        assert_equal(len(dis["vout"]), 3)
+        assert_equal(sum(o["valueSat"] for o in dis["vout"]), 1000 * COIN - DISSOLVE_FEE)
         # every participant's principal actually arrived at its own immutable refund address
         received_after = [node.getreceivedbyaddress(r, 0) for r in refunds]
         for i in range(3):

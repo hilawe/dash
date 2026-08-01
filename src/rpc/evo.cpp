@@ -319,9 +319,12 @@ static MasternodePayoutShares ParsePayouts(const UniValue& value, const std::str
     return payouts;
 }
 
+// Funds from coins held at ANY of fundDests, with change to the first. The multi-destination form
+// exists because a shared registration is genuinely multi-party: funding it from one address means
+// one key signs every input, which cannot represent two participants contributing independently.
 template <typename SpecialTxPayload>
 static void FundSpecialTx(CWallet& wallet, CMutableTransaction& tx, const SpecialTxPayload& payload,
-                          const CTxDestination& fundDest) EXCLUSIVE_LOCKS_REQUIRED(!wallet.cs_wallet)
+                          const std::vector<CTxDestination>& fundDests) EXCLUSIVE_LOCKS_REQUIRED(!wallet.cs_wallet)
 {
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
@@ -330,7 +333,8 @@ static void FundSpecialTx(CWallet& wallet, CMutableTransaction& tx, const Specia
     LOCK(wallet.cs_wallet);
 
     CTxDestination nodest = CNoDestination();
-    if (fundDest == nodest) {
+    if (fundDests.empty() || std::any_of(fundDests.begin(), fundDests.end(),
+                                         [&](const CTxDestination& d) { return d == nodest; })) {
         throw JSONRPCError(RPC_INTERNAL_ERROR, "No source of funds specified");
     }
 
@@ -354,18 +358,19 @@ static void FundSpecialTx(CWallet& wallet, CMutableTransaction& tx, const Specia
     }
 
     CCoinControl coinControl;
-    coinControl.destChange = fundDest;
+    coinControl.destChange = fundDests.front();
     coinControl.fRequireAllInputs = false;
 
     for (const auto& out : AvailableCoinsListUnspent(wallet).all()) {
         CTxDestination txDest;
-        if (ExtractDestination(out.txout.scriptPubKey, txDest) && txDest == fundDest) {
+        if (ExtractDestination(out.txout.scriptPubKey, txDest) &&
+            std::find(fundDests.begin(), fundDests.end(), txDest) != fundDests.end()) {
             coinControl.Select(out.outpoint);
         }
     }
 
     if (!coinControl.HasSelected()) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("No funds at specified address %s", EncodeDestination(fundDest)));
+        throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("No funds at specified address %s", EncodeDestination(fundDests.front())));
     }
 
     auto res = CreateTransaction(wallet, vecSend, RANDOM_CHANGE_POSITION, coinControl, /*sign=*/true, tx.vExtraPayload.size());
@@ -384,6 +389,14 @@ static void FundSpecialTx(CWallet& wallet, CMutableTransaction& tx, const Specia
         CHECK_NONFATAL(it != tx.vout.end());
         tx.vout.erase(it);
     }
+}
+
+// single-destination form, which is what every caller other than a shared registration wants
+template <typename SpecialTxPayload>
+static void FundSpecialTx(CWallet& wallet, CMutableTransaction& tx, const SpecialTxPayload& payload,
+                          const CTxDestination& fundDest) EXCLUSIVE_LOCKS_REQUIRED(!wallet.cs_wallet)
+{
+    FundSpecialTx(wallet, tx, payload, std::vector<CTxDestination>{fundDest});
 }
 
 template<typename SpecialTxPayload>
@@ -2176,7 +2189,7 @@ static RPCHelpMan protx_shared_register()
             {"operatorReward", RPCArg::Type::NUM, RPCArg::Optional::NO, "Operator reward in percent (0-100)"},
             {"earlyPeriodBlocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "Length of the early period in blocks"},
             {"earlyPenalty", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Unilateral early-exit penalty (< min share)"},
-            {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund collateral and fee from"},
+            {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund collateral and fee from, or a JSON array of addresses. An array funds the collateral from several separately controlled coins, which is what a genuinely multi-party registration looks like; change goes to the first"},
             {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (lets a caller re-sign an input and submit the variant, to exercise transaction-identifier malleability). NOTE the selected inputs are NOT reserved: a second call, or any other wallet spend, can select the same coins and leave the returned hex unspendable. Normal raw-transaction behaviour, but it makes this flag regtest/devnet-only in practice"},
         },
         RPCResult{RPCResult::Type::STR_HEX, "txid_or_hex", "The transaction id, or the signed tx hex when submit is false"},
@@ -2228,8 +2241,20 @@ static RPCHelpMan protx_shared_register()
     ptx.nEarlyPeriodBlocks = request.params[4].getInt<int64_t>();
     ptx.nEarlyPenalty = AmountFromValue(request.params[5]);
 
-    CTxDestination fundDest = DecodeDestination(request.params[6].get_str());
-    if (!IsValidDestination(fundDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid fund address");
+    // one address, or an array of them so the collateral is funded from separately controlled coins
+    std::vector<CTxDestination> fundDests;
+    if (request.params[6].isArray()) {
+        for (size_t i = 0; i < request.params[6].size(); ++i) {
+            CTxDestination d = DecodeDestination(request.params[6][i].get_str());
+            if (!IsValidDestination(d)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid fund address");
+            fundDests.push_back(d);
+        }
+        if (fundDests.empty()) throw JSONRPCError(RPC_INVALID_PARAMETER, "fundAddress array is empty");
+    } else {
+        CTxDestination d = DecodeDestination(request.params[6].get_str());
+        if (!IsValidDestination(d)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid fund address");
+        fundDests.push_back(d);
+    }
 
     // the template collateral output
     CAmount collateral = GetMnType(MnType::Regular).collat_amount;
@@ -2240,7 +2265,7 @@ static RPCHelpMan protx_shared_register()
 
     // pre-size the joinSigs so the funding fee accounts for them, then fund
     ptx.vecJoinSigs.assign(ptx.shares.size(), std::vector<unsigned char>(SharedCollateral::COMPACT_SIG_SIZE));
-    FundSpecialTx(*pwallet, tx, ptx, fundDest);
+    FundSpecialTx(*pwallet, tx, ptx, fundDests);
 
     // locate the template collateral output and set the internal collateral outpoint
     uint32_t collateralIndex = (uint32_t)-1;

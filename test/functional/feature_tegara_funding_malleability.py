@@ -70,12 +70,13 @@ class TegaraFundingMalleabilityTest(DashTestFramework):
         owner0, owner1 = node.getnewaddress(), node.getnewaddress()
         voting = node.getnewaddress()
         operator = node.bls("generate")["public"]
-        fund_addr = node.getnewaddress()
-        # TWO separate coins at the funding address, each too small to cover the 1000 DASH
-        # collateral alone, so the registration must spend both and carries two independently
-        # signed inputs. Those two inputs stand in for two co-funders.
-        node.sendtoaddress(fund_addr, 600)
-        node.sendtoaddress(fund_addr, 501)
+        # TWO SEPARATE funding addresses, so the two contributions are controlled by two DIFFERENT
+        # keys, which is what makes the mutation below a genuine one-participant action rather than
+        # one key re-signing one of its own inputs. Neither coin covers the 1000 DASH collateral
+        # alone, so the registration must spend both.
+        fund_addr0, fund_addr1 = node.getnewaddress(), node.getnewaddress()
+        node.sendtoaddress(fund_addr0, 600)
+        node.sendtoaddress(fund_addr1, 501)
         self.bump_mocktime(10 * 60 + 1)
         self.generate(node, 1, sync_fun=self.no_op)
 
@@ -88,18 +89,22 @@ class TegaraFundingMalleabilityTest(DashTestFramework):
 
         self.log.info("build and sign a shared registration WITHOUT submitting it")
         signed_hex = node.protxsharedregister(
-            shares, operator, voting, 0, early_period, early_penalty, fund_addr, False)
+            shares, operator, voting, 0, early_period, early_penalty,
+            [fund_addr0, fund_addr1], False)
         original = from_hex(CTransaction(), signed_hex)
         original.rehash()
         original_txid = original.hash
         # nothing is on chain or in the mempool yet
         assert_raises_rpc_error(-5, "No such mempool or blockchain transaction",
                                 node.getrawtransaction, original_txid)
-        # the two funding coins really did become two separately signed inputs, which is what
-        # makes the single-participant mutation below meaningful rather than a whole-transaction
-        # re-sign
+        # the two funding coins really did become two separately signed inputs, under two DIFFERENT
+        # keys, which is what makes the single-participant mutation below meaningful rather than a
+        # whole-transaction re-sign by one key
         assert_greater_than(len(original.vin), 1)
         assert all(len(txin.scriptSig) > 0 for txin in original.vin)
+        spent_addrs = {node.gettxout(f"{txin.prevout.hash:064x}", txin.prevout.n)
+                       ["scriptPubKey"]["address"] for txin in original.vin}
+        assert_equal(spent_addrs, {fund_addr0, fund_addr1})
 
         self.log.info("ONE participant re-signs ONLY their own input (the co-signer mutation)")
         # Re-sign everything under a different signature hash type, then keep only input 0's new
@@ -183,6 +188,10 @@ class TegaraFundingMalleabilityTest(DashTestFramework):
         assert_equal(pays[refund1], (500 + early_penalty) * COIN)
         # the actor is short exactly the penalty and the builder's flat fee, to the duff
         assert_equal(pays[refund0], (500 - early_penalty) * COIN - DISSOLVE_FEE)
+        # and nothing else was paid: counted on the raw vout, since the map above would collapse
+        # two outputs to one address and drop any output carrying no address
+        assert_equal(len(dis["vout"]), 2)
+        assert_equal(sum(o["valueSat"] for o in dis["vout"]), 1000 * COIN - DISSOLVE_FEE)
 
         self.log.info("Co-signer mutation applied to a shared registration: the identifier changed "
                       "before confirmation and the covenant was unaffected, because refund "
