@@ -18,6 +18,7 @@ The test registers a two-participant shared masternode, shows a normal transacti
 spend the template collateral, dissolves it unilaterally during the early period, and
 confirms every participant's principal landed at its immutable refund address.
 """
+from test_framework.messages import CTransaction, from_hex
 from test_framework.test_framework import DashTestFramework
 from test_framework.util import (
     assert_equal,
@@ -38,6 +39,11 @@ class TegaraSharedCollateralTest(DashTestFramework):
         self.set_dash_test_params(1, 0, extra_args=[[
             f"-vbparams=v24:{self.mocktime}:999999999999:{V24_ACTIVATION_THRESHOLD}:10:8:6:5:0",
             "-acceptnonstdtxn=1",
+            # the node type case below appends a platform node id to a payload the wallet
+            # already fee-rated, so the transaction grows by 20 bytes and the POLICY fee
+            # floor would answer before consensus does. Dropping the floor keeps the
+            # consensus rule the thing being tested; nothing else here depends on it.
+            "-minrelaytxfee=0",
         ]])
 
     def activate_v24(self):
@@ -88,6 +94,41 @@ class TegaraSharedCollateralTest(DashTestFramework):
         # the penalty must be below the minimum share
         assert_raises_rpc_error(None, "bad-protx-share-penalty", node.protxsharedregister,
                                 shares, operator, voting, 0, early_period, 600, fund_addr)
+
+        self.log.info("consensus refuses a shared registration that is not a regular masternode")
+        # THE SCOPE RULE THE PROPOSAL RESTS ON. dips#187 shares apply to regular
+        # masternodes only, and a shared payload naming the evolution type is refused at
+        # consensus. Nothing else in this suite exercised that rule, so a change removing
+        # it would have gone unnoticed.
+        #
+        # The builder RPC cannot produce the case (it sets the regular type itself), so it
+        # is built the way the dissolution negatives are: take a valid, signed, UNSUBMITTED
+        # registration and change exactly one field. The payload carries its version and
+        # type as its first two fields, and an evolution payload carries a platform node id
+        # after the inputs hash, so the mutation sets the type and appends that id, leaving
+        # a payload that deserializes as the evolution form rather than one that fails to
+        # parse. Trivial validation runs before the consent signatures are verified, so the
+        # type rule answers first even though the mutation also breaks the joinSigs. The
+        # rejected transaction spends nothing, so the registration below still funds from
+        # the same coin.
+        unsubmitted = node.protxsharedregister(
+            shares, operator, voting, 0, early_period, early_penalty, fund_addr, False)
+        evo_tx = from_hex(CTransaction(), unsubmitted)
+        payload = bytearray(evo_tx.vExtraPayload)
+        # the offsets are asserted, not assumed: if the payload layout ever moves, this
+        # fails here rather than mutating some other field and passing for a wrong reason
+        assert_equal(int.from_bytes(payload[0:2], "little"), 4)  # the multi-payout version
+        assert_equal(int.from_bytes(payload[2:4], "little"), 0)  # regular, as the RPC built it
+        payload[2:4] = (1).to_bytes(2, "little")                 # the evolution type
+        # the platform node id sits AFTER the inputs hash but BEFORE the payload's
+        # trailing signature field, which a shared registration leaves empty because its
+        # collateral is internal and needs no ownership proof
+        assert_equal(payload[-1], 0)                             # that empty signature
+        payload[-1:-1] = b"\x11" * 20                            # platformNodeID
+        evo_tx.vExtraPayload = bytes(payload)
+        evo_tx.rehash()
+        assert_raises_rpc_error(None, "bad-protx-shared-type",
+                                node.sendrawtransaction, evo_tx.serialize().hex())
 
         self.log.info("register a shared masternode")
         txid = node.protxsharedregister(shares, operator, voting, 0, early_period, early_penalty, fund_addr)
