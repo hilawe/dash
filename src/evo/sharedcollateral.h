@@ -48,6 +48,15 @@ static constexpr CAmount MIN_SHARE_AMOUNT{100 * COIN};
 static constexpr uint32_t MAX_EARLY_PERIOD_BLOCKS{420480}; // ~2 years at 2.5-minute blocks
 static constexpr size_t COMPACT_SIG_SIZE{65};
 
+// Consensus ceiling on a dissolution's transaction fee (spec 4.6 output rule 5): 0.01 DASH.
+// Value conservation means every duff not paid to a refund output leaves the ACTOR's share,
+// so fee and voluntary penalty overpayment are the two routes by which value can drain from
+// the actor beyond the required penalty. Both are capped, and both ceilings are
+// height-independent, which is what keeps validity monotone: a dissolution valid at one
+// height stays valid at every later height. With the ceilings, a lost owner key costs the
+// actor at most earlyPenalty + MAX_DIS_FEE.
+static constexpr CAmount MAX_DIS_FEE{1000000};
+
 // Compute a*b/c with a wide intermediate. The reward and penalty splits multiply two
 // duff-scale values (a share amount is ~9e10 duffs for a 900 DASH share), whose product
 // exceeds int64 (~9.2e18) and would overflow a plain CAmount multiply. The true quotient

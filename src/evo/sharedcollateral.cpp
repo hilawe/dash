@@ -131,8 +131,8 @@ static uint256 CalcTxOutputsHash(const CTransaction& tx)
 uint256 ComputeSharedRegConsentHash(const CProRegTx& proTx, const CTransaction& tx)
 {
     // spec 4.5: "DashSharedMNReg" || payload version || tx version || tx type ||
-    // tx nLockTime || inputsHash || outputsHash || type || mode || netInfo and
-    // Platform fields || keyIdVoting || pubKeyOperator || operatorReward ||
+    // tx nLockTime || inputsHash || all input sequences || outputsHash || type ||
+    // mode || netInfo || keyIdVoting || pubKeyOperator || operatorReward ||
     // shares || earlyPeriodBlocks || earlyPenalty
     CHashWriter hw(SER_GETHASH, CLIENT_VERSION);
     hw << std::string("DashSharedMNReg");
@@ -141,12 +141,20 @@ uint256 ComputeSharedRegConsentHash(const CProRegTx& proTx, const CTransaction& 
     hw << tx.nType;
     hw << tx.nLockTime;
     hw << CalcTxInputsHash(tx);
+    // CalcTxInputsHash covers prevouts only. The sequences are hashed separately because
+    // BIP68 gives them consensus meaning on tx version 2 and later, so a sequence left
+    // uncovered could be rewritten between consent signing and funding-input signing to
+    // impose a relative timelock of up to several months on a fully consented
+    // registration, without any participant having agreed to it.
+    for (const auto& in : tx.vin) hw << in.nSequence;
     hw << CalcTxOutputsHash(tx);
     hw << proTx.nType;
     hw << proTx.nMode;
     hw << NetInfoSerWrapper(const_cast<std::shared_ptr<NetInfoInterface>&>(proTx.netInfo),
                             proTx.nVersion >= ProTxVersion::ExtAddr);
-    hw << proTx.platformNodeID << proTx.platformP2PPort << proTx.platformHTTPPort;
+    // The Platform fields are deliberately NOT hashed: a shared registration is required
+    // to be type 0 (Regular), which carries no Platform payload fields at all, so hashing
+    // them would commit to three values the payload does not have.
     hw << proTx.keyIDVoting;
     hw << proTx.pubKeyOperator;
     hw << proTx.nOperatorReward;

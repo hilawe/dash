@@ -1331,10 +1331,16 @@ bool CheckProDisTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
     const CAmount requiredPenalty = (unanimous || !early) ? 0 : dmn->pdmnState->nEarlyPenalty;
 
     // output rules (spec 4.6): one output per non-actor share i paying shares[i].refundScript
-    // in share order, optionally one final actor output. Minimum-based: overpaying is valid.
+    // in share order, optionally one final actor output. Minimum-based, with two ceilings
+    // (rules 5 and 6 below): overpaying the penalty is valid only up to the CONFIGURED
+    // earlyPenalty, and the fee is capped. Both ceilings are height-independent, unlike
+    // requiredPenalty, which is what keeps validity monotone under chain progress.
     const uint16_t a = opt_dis->actorIndex;
     CAmount W{0};
     for (uint16_t i = 0; i < sharesCount; ++i) if (i != a) W += shares[i].amount;
+    // Registration enforces that the share amounts sum exactly to the required collateral,
+    // so the share table is the authority on what the covenant output holds.
+    const CAmount collateralValue = W + shares[a].amount;
 
     size_t nonActorCount = sharesCount - 1;
     if (tx.vout.size() < nonActorCount || tx.vout.size() > nonActorCount + 1) {
@@ -1359,6 +1365,29 @@ bool CheckProDisTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
     }
     if (bonusSum < requiredPenalty) {
         return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-penalty");
+    }
+    // rule 6: a unilateral dissolution may not overpay the penalty beyond the configured
+    // earlyPenalty. Unanimous dissolutions are deliberately NOT constrained here: every
+    // share owner signed these exact outputs, so they may distribute bonuses freely above
+    // the per-share minimums. The ceiling is nEarlyPenalty, not requiredPenalty, so that a
+    // standby paying the full penalty stays valid after the early period ends.
+    if (unilateral && bonusSum > dmn->pdmnState->nEarlyPenalty) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-bonus-ceiling");
+    }
+    // rule 5: the fee is the collateral value less every output, and it is capped. Without
+    // this, a dissolution could pay the actor's whole share to miners as fee.
+    CAmount outSum{0};
+    for (const auto& out : tx.vout) {
+        if (out.nValue < 0 || !MoneyRange(out.nValue)) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-outvalue");
+        }
+        outSum += out.nValue;
+    }
+    if (outSum > collateralValue) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-outsum");
+    }
+    if (collateralValue - outSum > SharedCollateral::MAX_DIS_FEE) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-prodistx-fee-ceiling");
     }
     // optional actor output must pay the actor's refund script
     if (tx.vout.size() == nonActorCount + 1) {
@@ -1438,8 +1467,21 @@ bool CheckProUpShareTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*>
     if (!CheckInputsHash(tx, *opt_ptx, state)) {
         return false;
     }
-    if (check_sigs && !CheckHashSig(*opt_ptx, PKHash(shares[opt_ptx->shareIndex].ownerKeyID), state)) {
-        return false;
+    // The canonical (65-byte, low-S) requirement covers EVERY signature this DIP introduces,
+    // ProUpShareTx included, not only joinSigs and dissolution signatures. CheckHashSig
+    // recovers through RecoverCompact, which normalizes S internally and therefore accepts a
+    // high-S variant of a valid signature: same signer, same digest, different bytes, and so
+    // a different transaction id that a third party can produce. Gated on check_sigs to match
+    // the joinSigs and ProDisTx canonical checks and every other payload signature check in
+    // this file, all of which a node skips in the same ranges where it skips signature
+    // validation outright.
+    if (check_sigs) {
+        if (!SharedCollateral::IsCanonicalCompactSig(opt_ptx->vchSig)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-proupsharetx-sig-noncanonical");
+        }
+        if (!CheckHashSig(*opt_ptx, PKHash(shares[opt_ptx->shareIndex].ownerKeyID), state)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1537,6 +1579,18 @@ bool CheckProUpRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> p
     auto dmn = mnList.GetMN(opt_ptx->proTxHash);
     if (!dmn) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-protx-hash");
+    }
+
+    // dips#187: a shared masternode's registrar fields are updatable ONLY by a
+    // ProUpSharedRegTx carrying every share owner's signature. Rejecting the plain
+    // ProUpRegTx explicitly matters because the only thing otherwise standing in its way is
+    // that a shared registration's legacy keyIDOwner is all zeros, so the owner-key check
+    // below would have to recover a public key hashing to the null key ID. That is a
+    // preimage problem rather than a rule, it is not evaluated at all when check_sigs is
+    // false, and it would leave this function free to overwrite the operator and voting keys
+    // of a masternode whose owner authority lives in the share table.
+    if (!dmn->pdmnState->shares.empty()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-upreg");
     }
 
     if (!IsVersionChangeValid(pindexPrev, tx.nType, dmn->pdmnState->nVersion, opt_ptx->nVersion, chainman, state)) {

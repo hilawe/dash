@@ -130,6 +130,35 @@ class TegaraSharedCollateralTest(DashTestFramework):
         assert_raises_rpc_error(None, "bad-protx-shared-type",
                                 node.sendrawtransaction, evo_tx.serialize().hex())
 
+        self.log.info("registration consent binds the funding input sequences")
+        # The consent digest hashes every input's nSequence alongside the prevouts. Without
+        # that, a funding signer could rewrite a sequence after the participants had signed,
+        # and their consents would stay valid over the altered transaction. Sequences carry
+        # BIP68 relative timelocks on version 2 and later transactions, so the rewrite can
+        # delay a fully consented registration by months with nobody having agreed to it.
+        #
+        # The mutation is exactly one field, on an otherwise valid signed registration.
+        # Rewriting the sequence also breaks the funding input's own script signature, but
+        # special-transaction checks run in PreChecks, ahead of PolicyScriptChecks, so the
+        # consent failure is what answers. That ordering is the whole point of asserting the
+        # SPECIFIC refusal here: before the sequences entered the digest, this transaction
+        # was refused for a script signature instead, so a digest that stopped covering them
+        # would change this message rather than merely still failing.
+        unsubmitted_seq = node.protxsharedregister(
+            shares, operator, voting, 0, early_period, early_penalty, fund_addr, False)
+        seq_tx = from_hex(CTransaction(), unsubmitted_seq)
+        assert_greater_than(len(seq_tx.vin), 0)
+        original_sequence = seq_tx.vin[0].nSequence
+        # A BIP68-meaningful value that is necessarily DIFFERENT from whatever the wallet
+        # set. Choosing a constant would pass vacuously on the day the wallet happens to
+        # use that same constant: the mutation would be a no-op and the transaction would
+        # be refused for some unrelated reason, or not refused at all.
+        seq_tx.vin[0].nSequence = 0xfffffffd if original_sequence != 0xfffffffd else 0xfffffffe
+        assert seq_tx.vin[0].nSequence != original_sequence
+        seq_tx.rehash()
+        assert_raises_rpc_error(None, "bad-protx-joinsig",
+                                node.sendrawtransaction, seq_tx.serialize().hex())
+
         self.log.info("register a shared masternode")
         txid = node.protxsharedregister(shares, operator, voting, 0, early_period, early_penalty, fund_addr)
         self.bump_mocktime(10 * 60 + 1)
@@ -162,6 +191,39 @@ class TegaraSharedCollateralTest(DashTestFramework):
         # template is anyone-can-spend at the script layer, so no signature is needed; consensus
         # rejects the spend because it is not a ProDisTx.
         assert_raises_rpc_error(-26, "bad-txns-template-spend", node.sendrawtransaction, steal)
+
+        self.log.info("the dissolution fee is capped at MAX_DIS_FEE")
+        # Value conservation means every duff not paid to a refund output comes out of the
+        # ACTOR's share, so an uncapped fee is a route for the actor's whole principal to
+        # leave to miners. MAX_DIS_FEE is 1,000,000 duffs; ask for twice that.
+        assert_raises_rpc_error(None, "bad-prodistx-fee-ceiling", node.protxshareddissolve,
+                                txid, 0, "unilateral", 2 * 1000000)
+        # and the ceiling is a ceiling, not a fixed value: the default fee still works, which
+        # is what the successful dissolution at the end of this test relies on
+        assert_raises_rpc_error(None, "bad-prodistx-fee-ceiling", node.protxshareddissolve,
+                                txid, 0, "unilateral", 1000001)
+
+        self.log.info("a unilateral dissolution may not overpay the penalty beyond earlyPenalty")
+        # The other route by which value leaves the actor's share is voluntary penalty
+        # overpayment, concentrated onto a non-actor output. The ceiling is the CONFIGURED
+        # earlyPenalty (height-independent), not the height-dependent requiredPenalty, which
+        # is what keeps a standby dissolution valid forever once it is valid.
+        #
+        # Build a valid unilateral dissolution, then move one DASH from the actor output to
+        # the non-actor output. The sum is preserved, so the fee is untouched and the fee
+        # ceiling cannot be what answers; only the bonus ceiling can.
+        unsubmitted_dis = node.protxshareddissolve(txid, 0, "unilateral", 100000, False)
+        bonus_tx = from_hex(CTransaction(), unsubmitted_dis)
+        assert_equal(len(bonus_tx.vout), 2)  # one non-actor refund, one actor output
+        # vout[0] is the non-actor share (500 DASH) plus the whole 5 DASH penalty bonus
+        assert_equal(bonus_tx.vout[0].nValue, (500 + early_penalty) * COIN)
+        before_sum = bonus_tx.vout[0].nValue + bonus_tx.vout[1].nValue
+        bonus_tx.vout[0].nValue += COIN
+        bonus_tx.vout[1].nValue -= COIN
+        assert_equal(bonus_tx.vout[0].nValue + bonus_tx.vout[1].nValue, before_sum)
+        bonus_tx.rehash()
+        assert_raises_rpc_error(None, "bad-prodistx-bonus-ceiling",
+                                node.sendrawtransaction, bonus_tx.serialize().hex())
 
         self.log.info("participant 0 dissolves unilaterally during the early period")
         bal1_before = node.getreceivedbyaddress(refund1, 0)
