@@ -35,6 +35,7 @@ enum {
     TRANSACTION_ASSET_UNLOCK = 9,
     TRANSACTION_PROVIDER_DISSOLVE = 10,     // dips#187 ProDisTx (shared-collateral dissolution)
     TRANSACTION_PROVIDER_UPDATE_SHARE = 11, // dips#187 ProUpShareTx (share reward-script update)
+    TRANSACTION_PROVIDER_UPDATE_SHARED_REGISTRAR = 12, // dips#187 ProUpSharedRegTx (registrar update)
 };
 
 /** An outpoint - a combination of a transaction hash and an index n into its vout */

@@ -2377,6 +2377,89 @@ static RPCHelpMan protx_share_update()
     };
 }
 
+// ProUpSharedRegTx builder (spec 4.8). Rotates the whole-masternode registrar fields under a
+// signature from EVERY share owner. The wallet must hold all of them, which is a property of
+// this prototype constructor rather than of the protocol: in a real deployment each owner signs
+// the same payload hash separately and the signatures are collected. Regtest/devnet only.
+static RPCHelpMan protx_shared_update_registrar()
+{
+    return RPCHelpMan{"protxupdatesharedregistrar",
+        "\nBuild, fund, sign, and submit a ProUpSharedRegTx updating a shared masternode's\n"
+        "operator and voting keys (dips#187). Requires every share owner's signature, so the\n"
+        "wallet must hold every share owner key. Regtest/devnet prototype.\n",
+        {
+            {"proTxHash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The shared masternode's ProRegTx hash"},
+            {"operatorPubKey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The new operator BLS public key"},
+            {"votingAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "The new voting address"},
+            {"fundAddress", RPCArg::Type::STR, RPCArg::Optional::NO, "Address to fund the fee from"},
+            {"submit", RPCArg::Type::BOOL, RPCArg::Default{true}, "If false, return the signed tx hex instead of submitting (for building negative test cases)"},
+        },
+        RPCResult{RPCResult::Type::STR_HEX, "txid_or_hex", "The transaction id, or the signed tx hex when submit is false"},
+        RPCExamples{""},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const NodeContext& node = EnsureAnyNodeContext(request.context);
+    const ChainstateManager& chainman = EnsureChainman(node);
+    CChainstateHelper& chain_helper = *CHECK_NONFATAL(node.chain_helper);
+    CDeterministicMNManager& dmnman = *CHECK_NONFATAL(node.dmnman);
+
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    EnsureWalletIsUnlocked(*pwallet);
+
+    CProUpSharedRegTx ptx;
+    ptx.proTxHash = ParseHashV(request.params[0], "proTxHash");
+
+    auto dmn = dmnman.GetListAtChainTip().GetMN(ptx.proTxHash);
+    if (!dmn || dmn->pdmnState->shares.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "not a shared masternode");
+    }
+    const auto& shares = dmn->pdmnState->shares;
+
+    // v24-only feature, so the basic BLS scheme is the only one available here
+    ptx.pubKeyOperator.Set(ParseBLSPubKey(request.params[1].get_str(), "operator BLS key", /*legacy=*/false), false);
+
+    CTxDestination votingDest = DecodeDestination(request.params[2].get_str());
+    if (!IsValidDestination(votingDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid voting address");
+    const PKHash* votingPKHash = std::get_if<PKHash>(&votingDest);
+    if (!votingPKHash) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "voting address must be a P2PKH address");
+    ptx.keyIDVoting = ToKeyID(*votingPKHash);
+
+    CTxDestination fundDest = DecodeDestination(request.params[3].get_str());
+    if (!IsValidDestination(fundDest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "invalid fund address");
+
+    CMutableTransaction tx;
+    tx.nVersion = 3;
+    tx.nType = TRANSACTION_PROVIDER_UPDATE_SHARED_REGISTRAR;
+
+    // pre-size every signature so the funding fee accounts for them, exactly as the shared
+    // registration does for its joinSigs: the payload is serialized during funding while the
+    // signatures are produced afterwards, and without this the transaction is short by their
+    // bytes and fails the relay fee
+    ptx.vecSigs.assign(shares.size(), std::vector<unsigned char>(SharedCollateral::COMPACT_SIG_SIZE));
+    FundSpecialTx(*pwallet, tx, ptx, fundDest);
+    UpdateSpecialTxInputsHash(tx, ptx);
+
+    // Every owner signs the SAME payload hash, which omits both signature fields, and the
+    // signatures go in share order because consensus checks signature i against share i.
+    const uint256 payloadHash = ::SerializeHash(ptx);
+    {
+        LOCK(pwallet->cs_wallet);
+        for (size_t i = 0; i < shares.size(); ++i) {
+            ptx.vecSigs[i].clear();
+            if (!pwallet->SignSpecialTxPayload(payloadHash, shares[i].ownerKeyID, ptx.vecSigs[i])) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("failed to sign for share %d (owner key not in wallet?)", i));
+            }
+        }
+    }
+    SetTxPayload(tx, ptx);
+
+    const bool submit = request.params[4].isNull() ? true : request.params[4].get_bool();
+    return SignAndSendSpecialTx(request, chain_helper, chainman, tx, submit);
+},
+    };
+}
+
 static RPCHelpMan protx_shared_dissolve()
 {
     return RPCHelpMan{"protxshareddissolve",
@@ -2519,6 +2602,7 @@ Span<const CRPCCommand> GetWalletEvoRPCCommands()
         {"evo", &protx_shared_register},
         {"evo", &protx_shared_dissolve},
         {"evo", &protx_share_update},
+        {"evo", &protx_shared_update_registrar},
         {"hidden", &protx_register_legacy},
         {"hidden", &protx_register_fund_legacy},
         {"hidden", &protx_register_prepare_legacy},

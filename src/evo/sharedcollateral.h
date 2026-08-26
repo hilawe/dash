@@ -5,6 +5,7 @@
 #ifndef BITCOIN_EVO_SHAREDCOLLATERAL_H
 #define BITCOIN_EVO_SHAREDCOLLATERAL_H
 
+#include <bls/bls.h>
 #include <consensus/amount.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
@@ -163,6 +164,58 @@ public:
         READWRITE(obj.nVersion, obj.proTxHash, obj.shareIndex, obj.rewardScript, obj.inputsHash);
         if (!(s.GetType() & SER_GETHASH)) {
             READWRITE(obj.vchSig);
+        }
+    }
+
+    std::string ToString() const;
+    [[nodiscard]] UniValue ToJson() const;
+};
+
+// ProUpSharedRegTx (spec 4.8): updates the whole-masternode registrar fields (operator key
+// and voting key) and requires one signature from EVERY current share owner, in share order.
+// A shared masternode's legacy keyIDOwner is null, so the plain ProUpRegTx path cannot
+// authorize it and is refused for a shared masternode; this payload is the only route.
+// The operator reward is fixed at registration and is deliberately absent here, matching
+// the DIP-0003 ProUpRegTx model.
+class CProUpSharedRegTx
+{
+public:
+    static constexpr auto SPECIALTX_TYPE = TRANSACTION_PROVIDER_UPDATE_SHARED_REGISTRAR;
+
+    uint16_t nVersion{1};
+    uint256 proTxHash;
+    CBLSLazyPublicKey pubKeyOperator;
+    CKeyID keyIDVoting;
+    uint256 inputsHash;
+    // sigCount is implied by vecSigs.size() and must equal sharesCount. Unlike ProDisTx it
+    // is NOT committed into the digest: it needs no commitment because it can only ever
+    // equal the immutable sharesCount, so there is no second reading to malleate between.
+    std::vector<std::vector<unsigned char>> vecSigs;
+
+    SERIALIZE_METHODS(CProUpSharedRegTx, obj)
+    {
+        READWRITE(obj.nVersion);
+        if (obj.nVersion == 0 || obj.nVersion > 1) {
+            // unknown version, bail out early
+            return;
+        }
+        // Shared collateral is gated on v24, by which point the basic BLS scheme is the only
+        // one in play, so the key is never serialized in the legacy form.
+        READWRITE(obj.proTxHash,
+                  CBLSLazyPublicKeyVersionWrapper(const_cast<CBLSLazyPublicKey&>(obj.pubKeyOperator), false),
+                  obj.keyIDVoting,
+                  obj.inputsHash);
+        // The payload hash every owner signs omits BOTH signature fields entirely, which is
+        // the DIP-0003 convention for update payloads.
+        if (!(s.GetType() & SER_GETHASH)) {
+            uint8_t sig_count{0};
+            SER_WRITE(obj, sig_count = static_cast<uint8_t>(obj.vecSigs.size()));
+            READWRITE(sig_count);
+            SER_READ(obj, obj.vecSigs.assign(sig_count, std::vector<unsigned char>(SharedCollateral::COMPACT_SIG_SIZE)));
+            for (auto& sig : obj.vecSigs) {
+                SER_WRITE(obj, if (sig.size() != SharedCollateral::COMPACT_SIG_SIZE) throw std::ios_base::failure("ProUpSharedRegTx sig must be 65 bytes"));
+                READWRITE(Span{sig});
+            }
         }
     }
 

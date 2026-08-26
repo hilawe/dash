@@ -155,6 +155,88 @@ class TegaraShareLifecycleTest(DashTestFramework):
         # both refusals left the share table untouched
         assert_equal(node.protx("info", txid)["state"]["shares"], after)
 
+        self.log.info("every owner together rotates the registrar keys (ProUpSharedRegTx)")
+        # spec 4.8. A shared masternode's legacy keyIDOwner is null, so the plain ProUpRegTx
+        # path cannot authorize it; this payload, carrying one signature per share in share
+        # order, is the only route to the operator and voting keys.
+        new_operator = node.bls("generate")["public"]
+        new_voting = node.getnewaddress()
+        reg_txid = node.protxupdatesharedregistrar(txid, new_operator, new_voting, fund_addr)
+        self.confirm()
+
+        raw_reg = node.getrawtransaction(reg_txid, 1)
+        assert_equal(raw_reg["type"], 12)  # TRANSACTION_PROVIDER_UPDATE_SHARED_REGISTRAR
+        assert_equal(raw_reg["proUpSharedRegTx"]["proTxHash"], txid)
+        assert_equal(raw_reg["proUpSharedRegTx"]["sigCount"], 3)  # one per share, not a threshold
+
+        reg_state = node.protx("info", txid)["state"]
+        assert_equal(reg_state["pubKeyOperator"], new_operator)
+        assert_equal(reg_state["votingAddress"], new_voting)
+        # The registrar update reaches the registrar fields and NOTHING else: the share table,
+        # the penalty terms and the operator reward are all out of its scope.
+        assert_equal(reg_state["shares"], after)
+        assert_equal(reg_state["earlyPenalty"], early_penalty * COIN)
+        assert_equal(reg_state["earlyPeriodBlocks"], early_period)
+        # Changing the operator key bans the masternode, matching ProUpRegTx: the new operator
+        # has not proved service yet. Revival is an ordinary ProUpServTx, which the null
+        # keyIDOwner does not prevent.
+        assert_greater_than(reg_state["PoSeBanHeight"], 0)
+
+        self.log.info("the registrar update refuses a voting key that collides with a payee")
+        # The registration payee-reuse rule, applied in reverse: at registration no share script
+        # may pay the voting key, and here the voting key is what moves, so it must not land on
+        # a script already in use. Share 1 was rotated above, so its EFFECTIVE payee is the new
+        # reward script rather than its refund script, and both are checked.
+        assert_raises_rpc_error(None, "bad-proupsharedregtx-key-reuse",
+                                node.protxupdatesharedregistrar, txid, new_operator, refunds[0], fund_addr)
+        assert_raises_rpc_error(None, "bad-proupsharedregtx-key-reuse",
+                                node.protxupdatesharedregistrar, txid, new_operator, new_reward, fund_addr)
+
+        self.log.info("the registrar update requires one signature per share, not fewer")
+        # Build a valid update, then drop the last signature and decrement the count. Consensus
+        # must refuse on the count alone: a shared masternode has no unilateral registrar path,
+        # so "enough" signatures is never a subset of the owners.
+        valid_reg = node.protxupdatesharedregistrar(txid, node.bls("generate")["public"],
+                                                    node.getnewaddress(), fund_addr, False)
+        short_tx = from_hex(CTransaction(), valid_reg)
+        payload = bytearray(short_tx.vExtraPayload)
+        # offsets asserted, not assumed: version(2) proTxHash(32) operator(48) voting(20)
+        # inputsHash(32) = 134, then the signature count, then 65 bytes per signature
+        SIGCOUNT_OFFSET = 2 + 32 + 48 + 20 + 32
+        assert_equal(len(payload), SIGCOUNT_OFFSET + 1 + 65 * 3)
+        assert_equal(payload[SIGCOUNT_OFFSET], 3)
+        payload[SIGCOUNT_OFFSET] = 2          # claim two signatures
+        del payload[-65:]                     # and actually carry two
+        short_tx.vExtraPayload = bytes(payload)
+        short_tx.rehash()
+        assert_raises_rpc_error(-26, "bad-proupsharedregtx-sigcount",
+                                node.sendrawtransaction, short_tx.serialize().hex())
+
+        self.log.info("the registrar update binds each signature to its own share, in order")
+        # Signature i must be by share i's owner. Swapping two signatures keeps the count and
+        # the signer SET identical, so only the per-position binding can refuse it. Without
+        # that binding a valid set could be permuted into a different reading.
+        swap_reg = node.protxupdatesharedregistrar(txid, node.bls("generate")["public"],
+                                                   node.getnewaddress(), fund_addr, False)
+        swap_tx = from_hex(CTransaction(), swap_reg)
+        payload = bytearray(swap_tx.vExtraPayload)
+        assert_equal(payload[SIGCOUNT_OFFSET], 3)
+        sig0_at = SIGCOUNT_OFFSET + 1
+        sig1_at = sig0_at + 65
+        sig0 = bytes(payload[sig0_at:sig0_at + 65])
+        sig1 = bytes(payload[sig1_at:sig1_at + 65])
+        assert sig0 != sig1  # distinct owners, so the swap is a real change
+        payload[sig0_at:sig0_at + 65] = sig1
+        payload[sig1_at:sig1_at + 65] = sig0
+        swap_tx.vExtraPayload = bytes(payload)
+        swap_tx.rehash()
+        assert_raises_rpc_error(-26, "bad-proupsharedregtx-sig",
+                                node.sendrawtransaction, swap_tx.serialize().hex())
+
+        # none of the four refusals moved any state
+        assert_equal(node.protx("info", txid)["state"]["shares"], after)
+        assert_equal(node.protx("info", txid)["state"]["votingAddress"], new_voting)
+
         self.log.info("all three participants dissolve unanimously, during the early period")
         height_before = node.getblockcount()
         assert_greater_than(registered_height + early_period, height_before + 1)  # still early

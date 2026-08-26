@@ -228,3 +228,12 @@ std::string CProUpShareTx::ToString() const
 }
 
 // CProUpShareTx::ToJson() defined in evo/core_write.cpp (see the note above)
+
+std::string CProUpSharedRegTx::ToString() const
+{
+    return strprintf("CProUpSharedRegTx(nVersion=%d, proTxHash=%s, pubKeyOperator=%s, keyIDVoting=%s, sigCount=%d)",
+                     nVersion, proTxHash.ToString(), pubKeyOperator.Get().ToString(),
+                     keyIDVoting.ToString(), vecSigs.size());
+}
+
+// CProUpSharedRegTx::ToJson() defined in evo/core_write.cpp (see the note above)

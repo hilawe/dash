@@ -108,6 +108,8 @@ bool CheckProDisTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pin
                    const ChainstateManager& chainman, TxValidationState& state, bool check_sigs);
 bool CheckProUpShareTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev, CDeterministicMNManager& dmnman,
                        const ChainstateManager& chainman, TxValidationState& state, bool check_sigs);
+bool CheckProUpSharedRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev, CDeterministicMNManager& dmnman,
+                           const ChainstateManager& chainman, TxValidationState& state, bool check_sigs);
 
 
 /**

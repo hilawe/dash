@@ -24,6 +24,7 @@
 
 #include <chainparams.h>
 #include <consensus/amount.h>
+#include <util/check.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
 #include <hash.h>
@@ -209,6 +210,8 @@ static bool CheckSpecialTxInner(CDeterministicMNManager& dmnman, llmq::CQuorumSn
             return CheckProDisTx(tx, pindexPrev, dmnman, chainman, state, check_sigs);
         case TRANSACTION_PROVIDER_UPDATE_SHARE:
             return CheckProUpShareTx(tx, pindexPrev, dmnman, chainman, state, check_sigs);
+        case TRANSACTION_PROVIDER_UPDATE_SHARED_REGISTRAR:
+            return CheckProUpSharedRegTx(tx, pindexPrev, dmnman, chainman, state, check_sigs);
         }
     } catch (const std::exception& e) {
         LogPrintf("%s -- failed: %s\n", __func__, e.what());
@@ -551,6 +554,50 @@ bool CSpecialTxProcessor::RebuildListFromBlock(const CBlock& block, gsl::not_nul
             if (debugLogs) {
                 LogPrintf("%s -- MN %s share %d reward updated at height %d\n", __func__,
                           opt_ptx->proTxHash.ToString(), opt_ptx->shareIndex, nHeight);
+            }
+        } else if (tx.nType == TRANSACTION_PROVIDER_UPDATE_SHARED_REGISTRAR) {
+            // dips#187: apply a registrar update to deterministic state. The operator-key
+            // change semantics deliberately match ProUpRegTx: a changed operator key resets
+            // the operator fields and puts the masternode into the PoSe-banned state, because
+            // the new operator has not proved service yet. A shared masternode revives from
+            // that state through an ordinary ProUpServTx, which its null keyIDOwner does not
+            // prevent. The share table, penalty terms and operator reward are untouched here:
+            // this payload cannot reach them.
+            const auto opt_ptx = GetTxPayload<CProUpSharedRegTx>(tx);
+            if (!opt_ptx) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-proupsharedregtx-payload");
+            }
+            auto dmn = newList.GetMN(opt_ptx->proTxHash);
+            if (!dmn || dmn->pdmnState->shares.empty()) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-proupsharedregtx-mn");
+            }
+            auto newState = std::make_shared<CDeterministicMNState>(*dmn->pdmnState);
+            // CAPTURED BEFORE THE RESET, because ResetOperatorFields() also sets nVersion
+            // back to LegacyBLS. Reading the version after the reset and using it to tag the
+            // new key's scheme marks a basic-scheme key as legacy, which then renders through
+            // the wrong scheme. That defect is INTERMITTENT, since whether the mis-tagged key
+            // survives a round trip depends on its bytes, so it presents as a key that reads
+            // back as zeros for some operators and not others.
+            const uint16_t old_version{static_cast<uint16_t>(newState->nVersion)};
+            const bool operator_changed{newState->pubKeyOperator != opt_ptx->pubKeyOperator};
+            if (operator_changed) {
+                newState->ResetOperatorFields();
+                newState->BanIfNotBanned(nHeight);
+                newState->pubKeyOperator = opt_ptx->pubKeyOperator;
+            }
+            // Restore the version the reset clobbered. A registrar update does not change the
+            // payload version, so the masternode keeps the one it registered with.
+            if (!SetStateVersion(*newState, old_version, dmn->nType, state)) {
+                return false;
+            }
+            if (operator_changed) {
+                newState->pubKeyOperator.SetLegacy(old_version == ProTxVersion::LegacyBLS);
+            }
+            newState->keyIDVoting = opt_ptx->keyIDVoting;
+            newList.UpdateMN(opt_ptx->proTxHash, newState);
+            if (debugLogs) {
+                LogPrintf("%s -- MN %s registrar updated at height %d (operator changed: %d)\n", __func__,
+                          opt_ptx->proTxHash.ToString(), nHeight, operator_changed);
             }
         } else if (tx.nType == TRANSACTION_PROVIDER_UPDATE_REVOKE) {
             const auto opt_proTx = GetTxPayload<CProUpRevTx>(tx);
@@ -1481,6 +1528,95 @@ bool CheckProUpShareTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*>
         }
         if (!CheckHashSig(*opt_ptx, PKHash(shares[opt_ptx->shareIndex].ownerKeyID), state)) {
             return false;
+        }
+    }
+    return true;
+}
+
+bool CheckProUpSharedRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> pindexPrev,
+                           CDeterministicMNManager& dmnman, const ChainstateManager& chainman,
+                           TxValidationState& state, bool check_sigs)
+{
+    // dips#187 ProUpSharedRegTx: updates the whole-masternode registrar fields (operator key,
+    // voting key) with a signature from EVERY current share owner, in share order. This is the
+    // only route for a shared masternode, because its legacy keyIDOwner is null and the plain
+    // ProUpRegTx path is refused for it.
+    if (!DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_V24)) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-proupsharedregtx-inactive");
+    }
+    const auto opt_ptx = GetTxPayload<CProUpSharedRegTx>(tx);
+    if (!opt_ptx) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-payload");
+    }
+    if (opt_ptx->nVersion == 0 || opt_ptx->nVersion > 1) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-version");
+    }
+    if (!opt_ptx->pubKeyOperator.Get().IsValid()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-operator-key");
+    }
+    if (opt_ptx->keyIDVoting.IsNull()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-voting-key");
+    }
+
+    auto mnList = dmnman.GetListForBlock(pindexPrev);
+    auto dmn = mnList.GetMN(opt_ptx->proTxHash);
+    if (!dmn || dmn->pdmnState->shares.empty()) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-mn");
+    }
+    const auto& shares = dmn->pdmnState->shares;
+    const uint16_t sharesCount = static_cast<uint16_t>(shares.size());
+
+    // sigCount must equal sharesCount exactly: this payload has no unilateral mode.
+    if (opt_ptx->vecSigs.size() != sharesCount) {
+        return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-sigcount");
+    }
+
+    // An operator key already registered to a DIFFERENT masternode would make the deterministic
+    // list's unique-property index ambiguous, exactly as it would through ProUpRegTx.
+    if (mnList.HasUniqueProperty(opt_ptx->pubKeyOperator)) {
+        auto otherDmn = mnList.GetUniquePropertyMN(opt_ptx->pubKeyOperator);
+        if (opt_ptx->proTxHash != otherDmn->proTxHash) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-dup-key");
+        }
+    }
+
+    // The registration payee-reuse rule, applied in reverse. At registration no share script may
+    // pay the voting key; here the VOTING KEY moves instead, so it must not land on a script
+    // already in use. Without this a registrar update could quietly re-create the very collision
+    // registration forbids. "Effective" reward script means the one actually paid: a share with
+    // an empty rewardScript is paid at its refundScript.
+    const CScript votingP2PKH = GetScriptForDestination(PKHash(opt_ptx->keyIDVoting));
+    for (const auto& share : shares) {
+        if (share.refundScript == votingP2PKH ||
+            (share.rewardScript.empty() ? share.refundScript : share.rewardScript) == votingP2PKH) {
+            return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-proupsharedregtx-key-reuse");
+        }
+    }
+
+    if (!CheckInputsHash(tx, *opt_ptx, state)) {
+        return false;
+    }
+
+    if (check_sigs) {
+        // Every share owner signs the payload hash, which omits both signature fields. Order is
+        // consensus-significant: signature i must be by share i's owner key, so a valid set
+        // cannot be permuted into a different reading.
+        const uint256 payloadHash = ::SerializeHash(*opt_ptx);
+        // Indexed off the SIGNATURE vector, not sharesCount, so this loop cannot read past the
+        // end of a payload that supplied fewer signatures than the masternode has shares. The
+        // count check above already makes the two equal, so this changes no behaviour on any
+        // reachable path; it stops the loop's memory safety from resting on a check that lives
+        // somewhere else. Disabling that check during a mutation run made this loop read out of
+        // bounds on attacker-supplied data, which is how the dependency surfaced.
+        CHECK_NONFATAL(opt_ptx->vecSigs.size() == sharesCount);
+        for (size_t i = 0; i < opt_ptx->vecSigs.size(); ++i) {
+            if (!SharedCollateral::IsCanonicalCompactSig(opt_ptx->vecSigs[i])) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-proupsharedregtx-sig-noncanonical");
+            }
+            std::string strError;
+            if (!CHashSigner::VerifyHash(payloadHash, shares[i].ownerKeyID, opt_ptx->vecSigs[i], strError)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-proupsharedregtx-sig");
+            }
         }
     }
     return true;

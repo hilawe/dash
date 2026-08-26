@@ -413,6 +413,18 @@ UniValue CProUpShareTx::ToJson() const
     return ret;
 }
 
+UniValue CProUpSharedRegTx::ToJson() const
+{
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("version", nVersion);
+    ret.pushKV("proTxHash", proTxHash.ToString());
+    ret.pushKV("pubKeyOperator", pubKeyOperator.Get().ToString());
+    ret.pushKV("votingAddress", EncodeDestination(PKHash(keyIDVoting)));
+    ret.pushKV("inputsHash", inputsHash.ToString());
+    ret.pushKV("sigCount", (int)vecSigs.size());
+    return ret;
+}
+
 RPCResult CProUpRegTx::GetJsonHelp(const std::string& key, bool optional)
 {
     return {RPCResult::Type::OBJ, key, optional, key.empty() ? "" : "The masternode update registrar special transaction",
