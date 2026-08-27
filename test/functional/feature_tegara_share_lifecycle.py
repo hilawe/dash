@@ -155,6 +155,34 @@ class TegaraShareLifecycleTest(DashTestFramework):
         # both refusals left the share table untouched
         assert_equal(node.protx("info", txid)["state"]["shares"], after)
 
+        self.log.info("consensus refuses a high-S rotation signature")
+        # The low-S rule is what makes these transaction identifiers non-malleable, and it is
+        # the ONLY rule here a third party can break without any key: for every valid
+        # signature (r, s) there is a second valid one (r, n - s), by the same signer over the
+        # same digest, with different bytes and therefore a different transaction identifier.
+        # RecoverCompact normalises S internally, so it accepts both and the rule has to be an
+        # explicit check.
+        #
+        # Negating S is the whole mutation. It flips the recovery id's parity, so the header
+        # byte moves by one, and the result still recovers the same public key.
+        SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141
+        valid_sig_hex = node.protxupdateshare(txid, 0, node.getnewaddress(), fund_addr, False)
+        high_s_tx = from_hex(CTransaction(), valid_sig_hex)
+        pl = bytearray(high_s_tx.vExtraPayload)
+        # the payload ends with a compactSize-prefixed 65-byte compact signature
+        assert_equal(pl[-66], 65)
+        sig = pl[-65:]
+        header, r, s = sig[0], sig[1:33], int.from_bytes(sig[33:], "big")
+        assert 0 < s < SECP256K1_N // 2, "the wallet should have produced a low-S signature"
+        flipped = bytes([header ^ 1]) + bytes(r) + (SECP256K1_N - s).to_bytes(32, "big")
+        assert_greater_than(int.from_bytes(flipped[33:], "big"), SECP256K1_N // 2)  # now high-S
+        pl[-65:] = flipped
+        high_s_tx.vExtraPayload = bytes(pl)
+        high_s_tx.rehash()
+        assert_raises_rpc_error(-26, "bad-proupsharetx-sig-noncanonical",
+                                node.sendrawtransaction, high_s_tx.serialize().hex())
+        assert_equal(node.protx("info", txid)["state"]["shares"], after)
+
         self.log.info("every owner together rotates the registrar keys (ProUpSharedRegTx)")
         # spec 4.8. A shared masternode's legacy keyIDOwner is null, so the plain ProUpRegTx
         # path cannot authorize it; this payload, carrying one signature per share in share
@@ -236,6 +264,56 @@ class TegaraShareLifecycleTest(DashTestFramework):
         # none of the four refusals moved any state
         assert_equal(node.protx("info", txid)["state"]["shares"], after)
         assert_equal(node.protx("info", txid)["state"]["votingAddress"], new_voting)
+
+        self.log.info("a plain ProUpRegTx cannot touch a shared masternode's registrar")
+        # The counterpart to the rule above: ProUpSharedRegTx is the ONLY route to a shared
+        # masternode's registrar fields, so the ordinary ProUpRegTx must be refused for one.
+        # Deleting that rule and re-running showed what refuses this otherwise, which is the
+        # collateral-destination lookup: a shared masternode's collateral is the covenant
+        # template and carries no address. That is an incidental refusal from a check meant
+        # for collateral key reuse, which is the reason to state the rule explicitly.
+        #
+        # No RPC can build this (the wallet has no key for a null keyIDOwner), so the payload
+        # is assembled by hand. It only has to DESERIALIZE and pass trivial validation to reach
+        # the rule: the shared-masternode check sits ahead of the inputs-hash and signature
+        # checks, so both can be left unsatisfied here.
+        unspent = next(u for u in node.listunspent() if u["amount"] > 10)
+        # a deliberately huge fee, so appending the payload cannot drop the fee rate below the
+        # relay floor and answer before consensus does
+        raw = node.createrawtransaction(
+            [{"txid": unspent["txid"], "vout": unspent["vout"]}],
+            {node.getnewaddress(): float(unspent["amount"]) - 1})
+        signed = node.signrawtransactionwithwallet(raw)["hex"]
+        upreg = from_hex(CTransaction(), signed)
+
+        payout_script = bytes.fromhex(node.validateaddress(node.getnewaddress())["scriptPubKey"])
+        voting_script = bytes.fromhex(node.validateaddress(node.getnewaddress())["scriptPubKey"])
+        # the voting key id is sliced out of a P2PKH script, which is only valid for the exact
+        # form OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG; assert it rather than assume,
+        # or a different script type would silently yield the wrong 20 bytes
+        assert_equal(len(voting_script), 25)
+        assert_equal(voting_script[:3].hex(), "76a914")
+        # Version 4 ON PURPOSE, matching the masternode's own state version. An earlier draft
+        # used version 3, and with the shared-masternode rule disabled that payload was refused
+        # by the VERSION-CHANGE rule instead, which would have made this test prove only that
+        # something refuses it rather than that this rule does.
+        payload = b""
+        payload += struct.pack("<H", 4)                       # nVersion: MultiPayout
+        payload += bytes.fromhex(txid)[::-1]                  # proTxHash: the SHARED masternode
+        payload += struct.pack("<H", 0)                       # nMode, only 0 is valid
+        payload += bytes.fromhex(node.bls("generate")["public"])   # pubKeyOperator, 48 bytes
+        payload += voting_script[3:23]                        # keyIDVoting
+        payload += b"\x01"                                    # one payout entry
+        payload += bytes([len(payout_script)]) + payout_script
+        payload += struct.pack("<H", 10000)                   # the whole owner reward
+        payload += b"\x00" * 32                               # inputsHash, not reached
+        payload += b"\x00"                                    # empty signature, not reached
+        upreg.nVersion = 3
+        upreg.nType = 3                                       # TRANSACTION_PROVIDER_UPDATE_REGISTRAR
+        upreg.vExtraPayload = payload
+        upreg.rehash()
+        assert_raises_rpc_error(-26, "bad-protx-shared-upreg",
+                                node.sendrawtransaction, upreg.serialize().hex())
 
         self.log.info("all three participants dissolve unanimously, during the early period")
         height_before = node.getblockcount()

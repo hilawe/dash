@@ -1718,13 +1718,19 @@ bool CheckProUpRegTx(const CTransaction& tx, gsl::not_null<const CBlockIndex*> p
     }
 
     // dips#187: a shared masternode's registrar fields are updatable ONLY by a
-    // ProUpSharedRegTx carrying every share owner's signature. Rejecting the plain
-    // ProUpRegTx explicitly matters because the only thing otherwise standing in its way is
-    // that a shared registration's legacy keyIDOwner is all zeros, so the owner-key check
-    // below would have to recover a public key hashing to the null key ID. That is a
-    // preimage problem rather than a rule, it is not evaluated at all when check_sigs is
-    // false, and it would leave this function free to overwrite the operator and voting keys
-    // of a masternode whose owner authority lives in the share table.
+    // ProUpSharedRegTx carrying every share owner's signature, so the plain ProUpRegTx is
+    // refused for one. The spec states this as a rule, and it is worth being a rule rather
+    // than an accident.
+    //
+    // WHAT ACTUALLY REFUSES IT WITHOUT THIS CHECK, established by deleting the check and
+    // running it rather than by reading: the collateral-destination lookup below, with
+    // "bad-protx-collateral-dest". A shared masternode's collateral is the 7-byte covenant
+    // template, which carries no address, so ExtractDestination finds no destination in it.
+    // That refusal is INCIDENTAL: it comes from a check whose purpose is to stop collateral
+    // key reuse in payouts, and it happens to fail here. Two earlier readings of this code
+    // guessed the barrier was the null keyIDOwner making the owner-key signature a preimage
+    // problem; that check sits further down and is never reached. An accidental guarantee
+    // from an unrelated check is exactly what should not be load-bearing.
     if (!dmn->pdmnState->shares.empty()) {
         return state.Invalid(TxValidationResult::TX_BAD_SPECIAL, "bad-protx-shared-upreg");
     }
